@@ -330,3 +330,14 @@ uv build
 ```
 
 Tests use mocked HTTP transports and temporary config files. They do not contact a deployed server or upload live data.
+
+## Continuous integration
+
+GitHub Actions runs the same checks on every push to `main`, every pull request, and on manual dispatch. Each run uses Ubuntu with Python 3.11 and 3.14 and installs the locked dependencies with `uv sync --locked`, then:
+
+- runs the full pytest suite,
+- checks Ruff lint, formatting, and import ordering,
+- smoke-tests `ebs --version` and `--help` for every command, and
+- builds a wheel and a source distribution and verifies both contain every module in `src/ebs_cli`.
+
+The tests are fully mocked, so CI needs no credentials and never contacts a deployed server or an object store. The workflow requests only read access to the repository and does not publish anything; the build artifacts it produces stay untracked, like `uv build` output locally.

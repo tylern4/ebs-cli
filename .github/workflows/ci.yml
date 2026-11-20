@@ -1,0 +1,139 @@
+# Continuous integration for ebs-cli.
+#
+# Everything runs from the locked dependency set (`uv sync --locked`) and the
+# test suite is fully mocked, so no run needs credentials and no job ever
+# contacts a deployed EBS server, SFAPI, or an object store. Nothing is
+# published from CI; builds exist only to prove the package is buildable and
+# complete, and their artifacts stay untracked.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - name: Check out repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install uv with Python ${{ matrix.python-version }}
+        # astral-sh/setup-uv v10.4.0 (enable-cache defaults to auto: on for
+        # GitHub-hosted runners on push and pull_request events)
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Run test suite
+        run: uv run pytest
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff import hygiene
+        run: uv run ruff check --select I .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Smoke test CLI version and help
+        run: |
+          uv run ebs --version
+          uv run ebs --help
+          while IFS= read -r cmd; do
+            echo "::group::ebs ${cmd} --help"
+            uv run ebs ${cmd} --help
+            echo "::endgroup::"
+          done <<'EOF'
+          auth login
+          auth logout
+          projects list
+          projects use
+          projects show
+          triggers list
+          triggers show
+          triggers enable
+          triggers disable
+          events list
+          s3 credentials
+          s3 upload-url
+          s3 upload
+          s3 ls
+          s3 download
+          s3 rm
+          EOF
+
+  build:
+    name: Build and check package contents
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install uv
+        # astral-sh/setup-uv v10.4.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Check package contents
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          import tarfile
+          import zipfile
+
+          modules = {p.name for p in pathlib.Path("src/ebs_cli").glob("*.py")}
+
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          with zipfile.ZipFile(wheel) as zf:
+              wheel_modules = {
+                  name.rsplit("/", 1)[-1]
+                  for name in zf.namelist()
+                  if name.startswith("ebs_cli/") and name.endswith(".py")
+              }
+          assert modules <= wheel_modules, (
+              f"missing from wheel: {sorted(modules - wheel_modules)}"
+          )
+
+          sdist = next(pathlib.Path("dist").glob("*.tar.gz"))
+          with tarfile.open(sdist) as tf:
+              sdist_modules = {
+                  name.rsplit("/", 1)[-1]
+                  for name in tf.getnames()
+                  if "/ebs_cli/" in name and name.endswith(".py")
+              }
+          assert modules <= sdist_modules, (
+              f"missing from sdist: {sorted(modules - sdist_modules)}"
+          )
+
+          listing = ", ".join(sorted(modules))
+          print(
+              f"wheel and sdist each contain all {len(modules)} "
+              f"package modules: {listing}"
+          )
+          EOF
