@@ -11,6 +11,7 @@ from uuid import UUID
 import httpx
 import pytest
 from conftest import TRIGGER_ID, FakeAPI, trigger_data
+from rich.text import Text
 from typer.testing import CliRunner
 
 from ebs_cli import cli
@@ -337,7 +338,9 @@ def test_delete_help_names_the_reference_and_yes_option(runner: CliRunner) -> No
     assert result.exit_code == 0
     assert "TRIGGER_REF" in result.stdout
     assert "exact trigger name" in result.stdout
-    assert "--yes" in result.stdout
+    plain_help = Text.from_ansi(result.stdout).plain
+    assert "--yes" in plain_help
+    assert "Skip the interactive confirmation." in plain_help
 
 
 def test_delete_confirmation_failure_leaks_no_token(
