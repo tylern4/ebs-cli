@@ -10,6 +10,7 @@ import json
 import httpx
 import pytest
 from conftest import EVENT_ID, SIGNED_URL, TRIGGER_ID, FakeAPI, trigger_data
+from rich.text import Text
 from typer.testing import CliRunner
 
 from ebs_cli import cli
@@ -426,7 +427,7 @@ def test_list_help_shows_the_name_filter(runner: CliRunner) -> None:
     result = runner.invoke(app, ["triggers", "list", "--help"], env={"COLUMNS": "200"})
 
     assert result.exit_code == 0
-    assert "--name" in result.stdout
+    assert "--name" in Text.from_ansi(result.stdout).plain
 
 
 # --- Validation helper -------------------------------------------------------
