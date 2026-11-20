@@ -10,7 +10,15 @@ from rich.table import Table
 
 from ebs_cli import __version__
 from ebs_cli.client import EBSClient, normalize_server_url, validate_object_key
-from ebs_cli.config import DEFAULT_URL, load_token, save_token
+from ebs_cli.config import (
+    DEFAULT_URL,
+    config_path,
+    load_token,
+    save_project,
+    save_token,
+    saved_project,
+    validate_project_name,
+)
 from ebs_cli.config import logout as remove_token
 from ebs_cli.errors import CLIError
 from ebs_cli.models import Event, S3Credentials, Trigger
@@ -27,10 +35,12 @@ app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 auth_app = typer.Typer(help="Manage the personal EBS API token.", no_args_is_help=True)
+projects_app = typer.Typer(help="Discover Projects and manage the saved default.", no_args_is_help=True)
 triggers_app = typer.Typer(help="Inspect and control triggers.", no_args_is_help=True)
 events_app = typer.Typer(help="Inspect events and their associated jobs.", no_args_is_help=True)
 s3_app = typer.Typer(help="Get scoped S3 upload access.", no_args_is_help=True)
 app.add_typer(auth_app, name="auth")
+app.add_typer(projects_app, name="projects")
 app.add_typer(triggers_app, name="triggers")
 app.add_typer(events_app, name="events")
 app.add_typer(s3_app, name="s3")
@@ -43,11 +53,34 @@ DurationOption = Annotated[
     ),
 ]
 
+PROJECT_SOURCE_FLAG = "flag"
+PROJECT_SOURCE_ENVIRONMENT = "environment"
+PROJECT_SOURCE_SAVED = "saved"
+PROJECT_SOURCE_NONE = "none"
+
+PROJECT_SOURCE_LABELS = {
+    PROJECT_SOURCE_FLAG: "--project option",
+    PROJECT_SOURCE_ENVIRONMENT: "EBS_PROJECT environment variable",
+    PROJECT_SOURCE_SAVED: "saved default Project",
+    PROJECT_SOURCE_NONE: "no default Project is set",
+}
+
 
 class Options:
-    def __init__(self, url: str, project: str | None) -> None:
+    def __init__(self, url: str, project: str | None, project_source: str = PROJECT_SOURCE_NONE) -> None:
         self.url = url
         self.project = project
+        self.project_source = project_source
+
+
+def resolve_project(options: Options) -> tuple[str | None, str]:
+    """Return the effective Project and its source, without contacting the API."""
+    if options.project is not None:
+        return options.project, options.project_source
+    saved = saved_project()
+    if saved is not None:
+        return saved, PROJECT_SOURCE_SAVED
+    return None, PROJECT_SOURCE_NONE
 
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -91,12 +124,21 @@ def root(
     except CLIError as exc:
         print_error(str(exc))
         raise typer.Exit(exc.exit_code) from None
+    parameter_source = ctx.get_parameter_source("project")
+    source_name = parameter_source.name if parameter_source is not None else ""
+    if source_name == "COMMANDLINE":
+        project_source = PROJECT_SOURCE_FLAG
+    elif source_name == "ENVIRONMENT":
+        project_source = PROJECT_SOURCE_ENVIRONMENT
+    else:
+        project_source = PROJECT_SOURCE_NONE
     if project is not None:
-        project = project.strip()
-        if not project or not project.isascii() or any(not character.isprintable() for character in project):
-            print_error("Project must be a non-empty printable ASCII name.")
-            raise typer.Exit(2)
-    ctx.obj = Options(normalized_url, project)
+        try:
+            project = validate_project_name(project)
+        except CLIError as exc:
+            print_error(str(exc))
+            raise typer.Exit(exc.exit_code) from None
+    ctx.obj = Options(normalized_url, project, project_source)
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
         raise typer.Exit()
@@ -104,9 +146,14 @@ def root(
 
 def api_client(ctx: typer.Context) -> EBSClient:
     options = ctx.ensure_object(Options)
-    if options.project is None:
-        raise CLIError("Select a Project with --project or EBS_PROJECT.", exit_code=2)
-    return EBSClient(options.url, load_token(), options.project)
+    project, _source = resolve_project(options)
+    if project is None:
+        raise CLIError(
+            "No Project is selected. Run 'ebs projects list' to see your Projects and "
+            "'ebs projects use PROJECT' to save a default, or pass --project or set EBS_PROJECT.",
+            exit_code=2,
+        )
+    return EBSClient(options.url, load_token(), project)
 
 
 @auth_app.command("login")
@@ -115,17 +162,101 @@ def login() -> None:
     """Save a personal API token in an owner-only config file."""
     token = typer.prompt("Personal EBS API token", hide_input=True)
     path = save_token(token)
-    console.print(f"Saved API token to {path} with owner-only permissions.", markup=False)
+    message = f"Saved API token to {path} with owner-only permissions."
+    try:
+        keeps_project = saved_project(path) is not None
+    except CLIError:
+        keeps_project = False
+    if keeps_project:
+        message += " The saved default Project remains."
+    console.print(message, markup=False)
 
 
 @auth_app.command("logout")
 @guarded
 def logout() -> None:
-    """Remove the saved API token from the user config file."""
+    """Remove the saved API token, keeping any saved default Project."""
     if remove_token():
-        console.print("Removed the saved API token.")
+        try:
+            keeps_project = saved_project() is not None
+        except CLIError:
+            keeps_project = False
+        message = "Removed the saved API token."
+        if keeps_project:
+            message += " The saved default Project remains."
+        console.print(message)
     else:
         console.print("No saved API token was present.")
+
+
+@projects_app.command("list")
+@guarded
+def projects_list(ctx: typer.Context, json_output: JSONOption = False) -> None:
+    """List the Projects your account can access."""
+    options = ctx.ensure_object(Options)
+    with EBSClient(options.url, load_token(), None) as client:
+        projects = client.list_projects()
+    ordered = sorted(projects, key=lambda item: item.name)
+    if json_output:
+        print_json({"items": [{"name": project.name, "role": project.role} for project in ordered]})
+        return
+    table = Table(title="Projects")
+    table.add_column("Project")
+    table.add_column("Role")
+    for project in ordered:
+        table.add_row(text(project.name), text(project.role))
+    console.print(table)
+    if ordered:
+        console.print(
+            f"Showing {len(ordered)} Projects. Save a default with 'ebs projects use PROJECT'.",
+            markup=False,
+        )
+    else:
+        console.print("No Projects are associated with your account.")
+
+
+@projects_app.command("use")
+@guarded
+def projects_use(
+    ctx: typer.Context,
+    project: Annotated[str, typer.Argument(help="Exact Project name from 'ebs projects list'.")],
+) -> None:
+    """Validate a Project name and save it as your default."""
+    name = validate_project_name(project)
+    options = ctx.ensure_object(Options)
+    with EBSClient(options.url, load_token(), None) as client:
+        available = client.list_projects()
+    if not any(candidate.name == name for candidate in available):
+        raise CLIError(
+            f"Unknown Project '{name}'. Run 'ebs projects list' to see your Projects.",
+            exit_code=2,
+        )
+    path = save_project(name)
+    console.print(f"Saved default Project '{name}' to {path}.", markup=False)
+
+
+@projects_app.command("show")
+@guarded
+def projects_show(ctx: typer.Context, json_output: JSONOption = False) -> None:
+    """Show the effective Project and its source, without contacting the API."""
+    options = ctx.ensure_object(Options)
+    project, source = resolve_project(options)
+    if json_output:
+        print_json({"project": project, "source": source})
+        return
+    details = Table.grid(padding=(0, 2))
+    details.add_column(style="bold")
+    details.add_column()
+    details.add_row(text("Effective Project"), text(project if project is not None else "(none)"))
+    details.add_row(text("Source"), text(PROJECT_SOURCE_LABELS[source]))
+    if source == PROJECT_SOURCE_SAVED:
+        details.add_row(text("Config"), text(config_path()))
+    print_panel(details, title="Project selection")
+    if project is None:
+        console.print(
+            "Run 'ebs projects list' to see your Projects and 'ebs projects use PROJECT' to save a default.",
+            markup=False,
+        )
 
 
 @triggers_app.command("list")

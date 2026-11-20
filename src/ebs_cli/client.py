@@ -7,7 +7,16 @@ import httpx
 from pydantic import TypeAdapter, ValidationError
 
 from ebs_cli.errors import CLIError
-from ebs_cli.models import CursorPage, Event, OffsetPage, S3Credentials, Trigger, UploadURL
+from ebs_cli.models import (
+    CursorPage,
+    Event,
+    OffsetPage,
+    Project,
+    ProjectPage,
+    S3Credentials,
+    Trigger,
+    UploadURL,
+)
 from ebs_cli.output import safe_text
 from ebs_cli.security import redact_secrets
 
@@ -53,14 +62,17 @@ class EBSClient:
         self,
         url: str,
         token: str,
-        project: str,
+        project: str | None = None,
         *,
         transport: httpx.BaseTransport | None = None,
         timeout: httpx.Timeout | float = 30.0,
     ) -> None:
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        if project is not None:
+            headers["X-Group"] = project
         self._http = httpx.Client(
             base_url=normalize_server_url(url),
-            headers={"Authorization": f"Bearer {token}", "X-Group": project, "Accept": "application/json"},
+            headers=headers,
             follow_redirects=False,
             timeout=timeout,
             transport=transport,
@@ -88,6 +100,7 @@ class EBSClient:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
         sensitive: bool = False,
+        project_scoped: bool = True,
     ) -> Any:
         try:
             response = self._http.request(method, f"{API_PREFIX}{path}", params=params, json=json)
@@ -111,7 +124,10 @@ class EBSClient:
         if response.status_code == 401:
             message = "Authentication failed. Run 'ebs auth login' or update EBS_TOKEN."
         elif response.status_code == 403:
-            message = f"Access denied for the selected Project. {detail}"
+            if project_scoped:
+                message = f"Access denied for the selected Project. {detail}"
+            else:
+                message = f"Access denied. {detail}"
         elif response.status_code == 404:
             message = f"Requested EBS resource was not found. {detail}"
         elif response.status_code in {301, 302, 303, 307, 308}:
@@ -124,6 +140,15 @@ class EBSClient:
         else:
             message = f"Request failed with HTTP {response.status_code}. {detail}"
         raise CLIError(redact_secrets(safe_text(message, limit=700)))
+
+    def list_projects(self) -> list[Project]:
+        """Return the caller's Project memberships in endpoint order.
+
+        This request is authenticated but never scoped to a selected Project,
+        so no ``X-Group`` header is sent.
+        """
+        page = _parse(ProjectPage, self._request("GET", "/projects", project_scoped=False))
+        return list(page.items)
 
     def list_triggers(
         self, *, limit: int = 50, offset: int = 0, enabled: bool | None = None

@@ -163,6 +163,88 @@ def test_safe_nested_object_key_is_accepted() -> None:
     assert validate_object_key("incoming/data file.fits") == "incoming/data file.fits"
 
 
+def test_projects_request_uses_bearer_without_group_header_and_parses_items() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/projects"
+        assert request.method == "GET"
+        assert "X-Group" not in request.headers
+        assert request.headers["Authorization"] == "Bearer ebs_transport-test-token"
+        assert request.headers["Accept"] == "application/json"
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {"name": "dasrepo", "role": "user"},
+                    {"name": "nstaff", "role": "maintainer"},
+                ]
+            },
+        )
+
+    client = EBSClient(
+        "https://ebs.example.test", "ebs_transport-test-token", None, transport=httpx.MockTransport(handler)
+    )
+    with client:
+        projects = client.list_projects()
+
+    assert [(project.name, project.role) for project in projects] == [
+        ("dasrepo", "user"),
+        ("nstaff", "maintainer"),
+    ]
+
+
+def test_scoped_client_still_sends_group_header() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-Group"] == "physics"
+        return httpx.Response(200, json={"items": [], "total": 0, "limit": 50, "offset": 0})
+
+    client = EBSClient(
+        "https://ebs.example.test",
+        "ebs_transport-test-token",
+        "physics",
+        transport=httpx.MockTransport(handler),
+    )
+    with client:
+        page = client.list_triggers()
+
+    assert page.items == []
+
+
+def test_projects_access_denied_error_is_not_project_scoped() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"detail": "not permitted"})
+
+    client = EBSClient(
+        "https://ebs.example.test", "ebs_transport-test-token", None, transport=httpx.MockTransport(handler)
+    )
+    with client:
+        with pytest.raises(CLIError, match="Access denied\\."):
+            client.list_projects()
+
+
+def test_projects_auth_failure_gives_existing_guidance() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "invalid token"})
+
+    client = EBSClient(
+        "https://ebs.example.test", "ebs_transport-test-token", None, transport=httpx.MockTransport(handler)
+    )
+    with client:
+        with pytest.raises(CLIError, match="Authentication failed"):
+            client.list_projects()
+
+
+def test_malformed_projects_response_has_actionable_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": [{"name": "", "role": "user"}]})
+
+    client = EBSClient(
+        "https://ebs.example.test", "ebs_transport-test-token", None, transport=httpx.MockTransport(handler)
+    )
+    with client:
+        with pytest.raises(CLIError, match="expected EBS API format"):
+            client.list_projects()
+
+
 def test_server_url_rejects_embedded_credentials() -> None:
     with pytest.raises(CLIError):
         normalize_server_url("https://user:password@example.test")

@@ -4,7 +4,7 @@ import pytest
 from conftest import event_data, trigger_data
 from pydantic import ValidationError
 
-from ebs_cli.models import Event, OffsetPage, Trigger, UploadURL
+from ebs_cli.models import Event, OffsetPage, Project, ProjectPage, Trigger, UploadURL
 
 
 def test_typed_offset_page_parses_timestamp_and_trigger() -> None:
@@ -55,3 +55,24 @@ def test_upload_url_rejects_header_control_characters() -> None:
             headers={"X-Test": "bad\x1bvalue"},
             expires_at=datetime.now(UTC),
         )
+
+
+def test_project_page_parses_name_and_role_and_ignores_extras() -> None:
+    page = ProjectPage.model_validate(
+        {
+            "items": [
+                {"name": "dasrepo", "role": "user", "internal_field": "ignored"},
+                {"name": "nstaff", "role": "maintainer"},
+            ]
+        }
+    )
+
+    assert page.items[0].name == "dasrepo"
+    assert page.items[1].role == "maintainer"
+
+
+def test_project_rejects_empty_or_control_character_fields() -> None:
+    with pytest.raises(ValidationError):
+        Project.model_validate({"name": "", "role": "user"})
+    with pytest.raises(ValidationError):
+        Project.model_validate({"name": "dasrepo", "role": "bad\x1brole"})

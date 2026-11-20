@@ -98,6 +98,24 @@ class S3Credentials(BaseModel):
         return value
 
 
+class Project(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(min_length=1)
+    role: str = Field(min_length=1)
+
+    @field_validator("name", "role")
+    @classmethod
+    def reject_control_characters(cls, value: str) -> str:
+        if any(not character.isprintable() for character in value):
+            raise ValueError("project fields cannot contain control characters")
+        return value
+
+
+class ProjectPage(BaseModel):
+    items: list[Project]
+
+
 class UploadURL(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
