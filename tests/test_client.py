@@ -88,6 +88,50 @@ def test_s3_requests_match_endpoint_bodies() -> None:
     assert requests[0].method == requests[1].method == "POST"
 
 
+def test_s3_credentials_request_sends_operation_when_given() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "bucket": "ebs-physics",
+                "endpoint_url": "https://s3.example.test",
+                "region": "us-east-1",
+                "access_key_id": "access",
+                "secret_access_key": "secret",
+                "session_token": "session",
+                "expires_at": "2026-11-03T12:15:00Z",
+                "operation": "list",
+            },
+        )
+
+    with make_client(handler) as client:
+        credentials = client.s3_credentials(TRIGGER_ID, duration_seconds=1200, operation="list")
+
+    assert json.loads(requests[0].content) == {"duration_seconds": 1200, "operation": "list"}
+    assert credentials.bucket == "ebs-physics"
+
+
+def test_prefix_and_cursor_validation_rejects_unsafe_values() -> None:
+    from ebs_cli.client import validate_cursor, validate_prefix
+
+    assert validate_prefix("run/2026/") == "run/2026/"
+    assert validate_prefix("") == ""
+    assert validate_cursor(" opaque-token ") == "opaque-token"
+    with pytest.raises(CLIError):
+        validate_prefix("bad\nprefix")
+    with pytest.raises(CLIError):
+        validate_prefix("p" * 1025)
+    with pytest.raises(CLIError):
+        validate_cursor("")
+    with pytest.raises(CLIError):
+        validate_cursor("   ")
+    with pytest.raises(CLIError):
+        validate_cursor("bad\ncursor")
+
+
 def test_sensitive_error_does_not_echo_credentials_or_signed_url() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

@@ -22,7 +22,9 @@ def test_credentials_json_contains_all_temporary_values_only_on_stdout(
     assert body["secret_access_key"] == "temporary-secret"
     assert body["session_token"] == "temporary-session"
     assert body["bucket"] == "ebs-physics"
-    assert fake_api.calls == [("s3_credentials", TRIGGER_ID, {"duration_seconds": 1200})]
+    assert fake_api.calls == [
+        ("s3_credentials", TRIGGER_ID, {"duration_seconds": 1200, "operation": "upload"})
+    ]
 
 
 def test_credentials_shell_exports_all_temporary_values(runner: CliRunner, fake_api: FakeAPI) -> None:
@@ -121,7 +123,9 @@ def test_direct_upload_uses_credentials_and_hides_every_temporary_value(
 
     assert result.exit_code == 0, result.output
     assert "s3://ebs-physics/local-data.fits" in result.stdout
-    assert fake_api.calls == [("s3_credentials", TRIGGER_ID, {"duration_seconds": 900})]
+    assert fake_api.calls == [
+        ("s3_credentials", TRIGGER_ID, {"duration_seconds": 900, "operation": "upload"})
+    ]
     assert uploaded == [(fake_api.credentials, path, "local-data.fits")]
     for secret in ("temporary-access", "temporary-secret", "temporary-session", SIGNED_URL):
         assert secret not in result.stdout
@@ -148,7 +152,9 @@ def test_direct_upload_json_contains_only_target_and_success(
         "target": "s3://ebs-physics/folder/output.fits",
     }
     assert "url" not in result.stdout
-    assert fake_api.calls == [("s3_credentials", TRIGGER_ID, {"duration_seconds": 900})]
+    assert fake_api.calls == [
+        ("s3_credentials", TRIGGER_ID, {"duration_seconds": 900, "operation": "upload"})
+    ]
     for secret in ("temporary-access", "temporary-secret", "temporary-session"):
         assert secret not in result.stdout
 
@@ -193,3 +199,39 @@ def test_invalid_key_fails_before_requesting_signed_url(runner: CliRunner, fake_
     assert result.exit_code == 2
     assert fake_api.calls == []
     assert "Object key" in result.stderr
+
+
+OPERATION_EXAMPLES = [
+    ("upload", "upload_file", ("list_objects_v2", "get_object", "delete_object")),
+    ("list", "list_objects_v2", ("upload_file", "get_object", "delete_object")),
+    ("download", "get_object", ("upload_file", "list_objects_v2", "delete_object")),
+    ("delete", "delete_object", ("upload_file", "list_objects_v2", "get_object")),
+]
+
+
+@pytest.mark.parametrize(("operation", "expected", "absent"), OPERATION_EXAMPLES)
+def test_credentials_example_matches_selected_operation(
+    runner: CliRunner, fake_api: FakeAPI, operation: str, expected: str, absent: tuple[str, ...]
+) -> None:
+    result = runner.invoke(
+        app,
+        ["s3", "credentials", str(TRIGGER_ID), "--operation", operation],
+        env={"COLUMNS": "200"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert expected in result.stdout
+    for other in absent:
+        assert other not in result.stdout
+    assert fake_api.calls == [
+        ("s3_credentials", TRIGGER_ID, {"duration_seconds": 900, "operation": operation})
+    ]
+    # Unlike the direct object commands, `s3 credentials` intentionally prints
+    # the temporary values in its human-readable example.
+
+
+def test_credentials_rejects_unknown_operation(runner: CliRunner, fake_api: FakeAPI) -> None:
+    result = runner.invoke(app, ["s3", "credentials", str(TRIGGER_ID), "--operation", "fetch"])
+
+    assert result.exit_code == 2
+    assert fake_api.calls == []

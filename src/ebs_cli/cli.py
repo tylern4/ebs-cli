@@ -1,5 +1,7 @@
 import shlex
+import sys
 from collections.abc import Callable
+from enum import StrEnum
 from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
@@ -7,9 +9,16 @@ from uuid import UUID
 
 import typer
 from rich.table import Table
+from rich.text import Text
 
 from ebs_cli import __version__
-from ebs_cli.client import EBSClient, normalize_server_url, validate_object_key
+from ebs_cli.client import (
+    EBSClient,
+    normalize_server_url,
+    validate_cursor,
+    validate_object_key,
+    validate_prefix,
+)
 from ebs_cli.config import (
     DEFAULT_URL,
     config_path,
@@ -23,6 +32,7 @@ from ebs_cli.config import logout as remove_token
 from ebs_cli.errors import CLIError
 from ebs_cli.models import Event, S3Credentials, Trigger
 from ebs_cli.output import console, print_error, print_json, print_panel, safe_text, text
+from ebs_cli.s3ops import delete_object, download_object, list_objects
 from ebs_cli.security import redacted_headers
 from ebs_cli.uploads import upload_file
 
@@ -38,7 +48,7 @@ auth_app = typer.Typer(help="Manage the personal EBS API token.", no_args_is_hel
 projects_app = typer.Typer(help="Discover Projects and manage the saved default.", no_args_is_help=True)
 triggers_app = typer.Typer(help="Inspect and control triggers.", no_args_is_help=True)
 events_app = typer.Typer(help="Inspect events and their associated jobs.", no_args_is_help=True)
-s3_app = typer.Typer(help="Get scoped S3 upload access.", no_args_is_help=True)
+s3_app = typer.Typer(help="Get scoped S3 access and run direct object commands.", no_args_is_help=True)
 app.add_typer(auth_app, name="auth")
 app.add_typer(projects_app, name="projects")
 app.add_typer(triggers_app, name="triggers")
@@ -52,6 +62,16 @@ DurationOption = Annotated[
         "--duration-seconds", min=900, max=3600, help="Credential lifetime, from 900 to 3600 seconds."
     ),
 ]
+
+
+class S3Operation(StrEnum):
+    """Credential scopes the server can grant for one trigger's bucket."""
+
+    UPLOAD = "upload"
+    LIST = "list"
+    DOWNLOAD = "download"
+    DELETE = "delete"
+
 
 PROJECT_SOURCE_FLAG = "flag"
 PROJECT_SOURCE_ENVIRONMENT = "environment"
@@ -418,8 +438,9 @@ def _credential_exports(credentials: S3Credentials) -> list[str]:
     ]
 
 
-def _python_instructions(credentials: S3Credentials) -> list[str]:
-    return [
+def _python_instructions(credentials: S3Credentials, operation: S3Operation) -> list[str]:
+    bucket = credentials.bucket
+    lines = [
         "import boto3",
         "from botocore.config import Config",
         "",
@@ -437,8 +458,29 @@ def _python_instructions(credentials: S3Credentials) -> list[str]:
         "        read_timeout=120,",
         "    ),",
         ")",
-        f's3.upload_file("./FILE", {credentials.bucket!r}, "KEY")',
     ]
+    if operation is S3Operation.UPLOAD:
+        lines.append(f's3.upload_file("./FILE", {bucket!r}, "KEY")')
+    elif operation is S3Operation.LIST:
+        lines.extend(
+            (
+                f"response = s3.list_objects_v2(Bucket={bucket!r}, MaxKeys=100)",
+                'for item in response.get("Contents", []):',
+                '    print(item["Key"], item["Size"], item["LastModified"])',
+            )
+        )
+    elif operation is S3Operation.DOWNLOAD:
+        lines.extend(
+            (
+                f'response = s3.get_object(Bucket={bucket!r}, Key="KEY")',
+                'with open("./FILE", "wb") as local_file:',
+                '    for chunk in response["Body"].iter_chunks():',
+                "        local_file.write(chunk)",
+            )
+        )
+    else:
+        lines.append(f's3.delete_object(Bucket={bucket!r}, Key="KEY")')
+    return lines
 
 
 @s3_app.command("credentials")
@@ -447,6 +489,10 @@ def s3_credentials(
     ctx: typer.Context,
     trigger_id: UUID,
     duration_seconds: DurationOption = 900,
+    operation: Annotated[
+        S3Operation,
+        typer.Option("--operation", help="Credential scope: upload, list, download, or delete."),
+    ] = S3Operation.UPLOAD,
     json_output: JSONOption = False,
     shell: Annotated[
         bool, typer.Option("--shell", help="Write temporary credential environment exports.")
@@ -456,7 +502,9 @@ def s3_credentials(
     if json_output and shell:
         raise CLIError("Choose either --json or --shell, not both.", exit_code=2)
     with api_client(ctx) as client:
-        credentials = client.s3_credentials(trigger_id, duration_seconds=duration_seconds)
+        credentials = client.s3_credentials(
+            trigger_id, duration_seconds=duration_seconds, operation=operation.value
+        )
     if json_output:
         print_json(credentials.model_dump(mode="json"))
         return
@@ -464,14 +512,14 @@ def s3_credentials(
         for line in _credential_exports(credentials):
             typer.echo(line)
         return
-    lines = _python_instructions(credentials)
+    lines = _python_instructions(credentials, operation)
     lines.extend(
         (
             f"# Expires: {credentials.expires_at.isoformat()}",
             "# Credentials are scoped to this trigger's bucket.",
         )
     )
-    print_panel("\n".join(lines), title=f"Temporary upload credentials for {credentials.bucket}")
+    print_panel("\n".join(lines), title=f"Temporary {operation.value} credentials for {credentials.bucket}")
 
 
 @s3_app.command("upload-url")
@@ -533,13 +581,162 @@ def s3_upload(
         raise CLIError(f"Local file does not exist or is not a regular file: {file}", exit_code=2)
     object_key = validate_object_key(key if key is not None else file.name)
     with api_client(ctx) as client:
-        credentials = client.s3_credentials(trigger_id, duration_seconds=duration_seconds)
+        credentials = client.s3_credentials(
+            trigger_id, duration_seconds=duration_seconds, operation=S3Operation.UPLOAD.value
+        )
     upload_file(credentials, file, object_key)
     target = f"s3://{credentials.bucket}/{object_key}"
     if json_output:
         print_json({"bucket": credentials.bucket, "key": object_key, "status": "uploaded", "target": target})
     else:
         console.print(f"Uploaded {file.name} to {target}.", markup=False)
+
+
+def _validate_download_destination(destination: Path, *, force: bool) -> None:
+    """Reject unsafe local destinations before any credential exchange."""
+    parent = destination.parent
+    if not parent.is_dir():
+        raise CLIError(f"Destination directory does not exist: {parent}", exit_code=2)
+    if destination.is_symlink():
+        raise CLIError(
+            f"Destination is a symbolic link; refusing to write through it: {destination}", exit_code=2
+        )
+    try:
+        exists = destination.exists()
+    except OSError:
+        exists = False
+    if not exists:
+        return
+    if destination.is_dir():
+        raise CLIError(f"Destination is a directory: {destination}", exit_code=2)
+    if not force:
+        raise CLIError(f"Destination already exists. Use --force to overwrite it: {destination}", exit_code=2)
+
+
+def _stdin_is_interactive() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+@s3_app.command("ls")
+@guarded
+def s3_ls(
+    ctx: typer.Context,
+    trigger_id: UUID,
+    prefix: Annotated[str | None, typer.Option(help="Only keys that begin with this prefix.")] = None,
+    limit: Annotated[
+        int, typer.Option(min=1, max=1000, help="Maximum objects to fetch, from 1 to 1000.")
+    ] = 100,
+    cursor: Annotated[
+        str | None, typer.Option(help="Opaque continuation token from an earlier page.")
+    ] = None,
+    json_output: JSONOption = False,
+) -> None:
+    """List one bounded page of objects in the trigger's bucket."""
+    prefix_text = validate_prefix(prefix or "")
+    cursor_text = validate_cursor(cursor) if cursor is not None else None
+    with api_client(ctx) as client:
+        credentials = client.s3_credentials(
+            trigger_id, duration_seconds=900, operation=S3Operation.LIST.value
+        )
+    page = list_objects(credentials, prefix=prefix_text, limit=limit, cursor=cursor_text)
+    if json_output:
+        body: dict[str, Any] = {
+            "bucket": credentials.bucket,
+            "limit": limit,
+            "prefix": prefix_text,
+            "items": page["items"],
+        }
+        if page["next_cursor"]:
+            body["next_cursor"] = page["next_cursor"]
+        print_json(body)
+        return
+    title = Text(f"Objects in s3://{credentials.bucket}")
+    if prefix_text:
+        title.append(f" under {prefix_text}")
+    table = Table(title=title)
+    for column in ("Key", "Size", "Last modified"):
+        table.add_column(column)
+    for item in page["items"]:
+        table.add_row(text(item["key"]), text(item["size"]), text(item["last_modified"]))
+    console.print(table)
+    if page["items"]:
+        if page["next_cursor"]:
+            token = safe_text(page["next_cursor"], limit=1024)
+            console.print(f"More results are available. Use --cursor {token}", markup=False)
+        else:
+            console.print("No more results in this result set.")
+    else:
+        console.print("No objects matched this listing.")
+
+
+@s3_app.command("download")
+@guarded
+def s3_download(
+    ctx: typer.Context,
+    trigger_id: UUID,
+    key: Annotated[str, typer.Argument(help="Object key in the trigger's bucket.")],
+    file: Annotated[Path, typer.Argument(help="Local destination path for the object.")],
+    force: Annotated[
+        bool, typer.Option("--force", help="Overwrite an existing regular file at the destination.")
+    ] = False,
+    json_output: JSONOption = False,
+) -> None:
+    """Download one object to a local file with scoped temporary credentials."""
+    object_key = validate_object_key(key)
+    _validate_download_destination(file, force=force)
+    with api_client(ctx) as client:
+        credentials = client.s3_credentials(
+            trigger_id, duration_seconds=900, operation=S3Operation.DOWNLOAD.value
+        )
+    download_object(credentials, object_key, file, force=force)
+    target = f"s3://{credentials.bucket}/{object_key}"
+    if json_output:
+        print_json(
+            {
+                "bucket": credentials.bucket,
+                "key": object_key,
+                "path": str(file),
+                "status": "downloaded",
+                "target": target,
+            }
+        )
+    else:
+        console.print(f"Downloaded {target} to {file}.", markup=False)
+
+
+@s3_app.command("rm")
+@guarded
+def s3_rm(
+    ctx: typer.Context,
+    trigger_id: UUID,
+    key: Annotated[str, typer.Argument(help="Exact object key to delete.")],
+    yes: Annotated[bool, typer.Option("--yes", help="Skip the interactive confirmation.")] = False,
+    json_output: JSONOption = False,
+) -> None:
+    """Delete exactly one object from the trigger's bucket after confirmation."""
+    object_key = validate_object_key(key)
+    if not yes:
+        if not _stdin_is_interactive():
+            raise CLIError("Pass --yes to delete from a noninteractive session.", exit_code=2)
+        confirmed = typer.confirm(
+            f"Permanently delete {object_key!r} from trigger {trigger_id}'s bucket?", default=False
+        )
+        if not confirmed:
+            console.print("Deletion cancelled. Nothing was deleted.", markup=False)
+            raise typer.Exit(1)
+    with api_client(ctx) as client:
+        credentials = client.s3_credentials(
+            trigger_id, duration_seconds=900, operation=S3Operation.DELETE.value
+        )
+    delete_object(credentials, object_key)
+    target = f"s3://{credentials.bucket}/{object_key}"
+    if json_output:
+        print_json({"bucket": credentials.bucket, "key": object_key, "status": "deleted", "target": target})
+    else:
+        console.print(f"Deleted {target}.", markup=False)
 
 
 def main() -> None:

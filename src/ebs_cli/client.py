@@ -55,6 +55,21 @@ def validate_object_key(value: str) -> str:
     return value
 
 
+def validate_prefix(value: str) -> str:
+    if len(value.encode("utf-8")) > 1024 or any(not character.isprintable() for character in value):
+        raise CLIError("Prefix must be at most 1024 printable UTF-8 bytes.", exit_code=2)
+    return value
+
+
+def validate_cursor(value: str) -> str:
+    value = value.strip()
+    if not value or len(value.encode("utf-8")) > 1024:
+        raise CLIError("Cursor must be the opaque continuation token from an earlier page.", exit_code=2)
+    if any(not character.isprintable() for character in value):
+        raise CLIError("Cursor cannot contain control characters.", exit_code=2)
+    return value
+
+
 class EBSClient:
     """Typed synchronous client for the user API."""
 
@@ -184,14 +199,19 @@ class EBSClient:
             CursorPage[Event], self._request("GET", f"/triggers/{trigger_id}/events", params=params)
         )
 
-    def s3_credentials(self, trigger_id: UUID, *, duration_seconds: int = 900) -> S3Credentials:
-        body = self._request(
+    def s3_credentials(
+        self, trigger_id: UUID, *, duration_seconds: int = 900, operation: str | None = None
+    ) -> S3Credentials:
+        body: dict[str, Any] = {"duration_seconds": duration_seconds}
+        if operation is not None:
+            body["operation"] = operation
+        response = self._request(
             "POST",
             f"/triggers/{trigger_id}/s3/credentials",
-            json={"duration_seconds": duration_seconds},
+            json=body,
             sensitive=True,
         )
-        return _parse(S3Credentials, body, secret_response=True)
+        return _parse(S3Credentials, response, secret_response=True)
 
     def s3_upload_url(self, trigger_id: UUID, key: str, *, duration_seconds: int = 900) -> UploadURL:
         body = self._request(

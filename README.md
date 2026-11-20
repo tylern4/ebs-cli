@@ -1,6 +1,6 @@
 # ebs-cli
 
-`ebs` is a command-line client for NERSC Event Based Scheduling. It discovers your Projects, lists and controls triggers, shows events with their jobs, and uploads data to a trigger's S3 bucket using temporary, scoped access.
+`ebs` is a command-line client for NERSC Event Based Scheduling. It discovers your Projects, lists and controls triggers, shows events with their jobs, and runs direct S3 object commands against a trigger's bucket using temporary, operation-scoped access.
 
 The CLI uses personal EBS API tokens. It never asks for the object store's root key or system credentials.
 
@@ -147,7 +147,18 @@ ebs s3 credentials 12345678-1234-5678-1234-567812345678
 
 This command intentionally prints the access key, secret key, and session token to stdout. Keep them out of logs and shared terminals. The default lifetime is 900 seconds. Choose 900 through 3600 seconds with `--duration-seconds`.
 
-The human-readable output is a Python example that passes all three temporary values directly to boto3. It sets the returned endpoint and region, SigV4 signing, path-style addressing, and connection timeouts. It uses boto3's managed `upload_file`, which can switch to multipart uploads for large files:
+Each exchange is scoped to one operation. Request exactly the scope you need with `--operation`; the server derives the least-privilege policy from it:
+
+| Operation | Allows | Withholds |
+| --- | --- | --- |
+| `upload` (default) | Put objects, multipart uploads, and bucket listing | Reading or deleting objects |
+| `list` | One bounded `ListObjectsV2` page | Reading, writing, deleting |
+| `download` | Reading one specified object | Listing, writing, deleting |
+| `delete` | Deleting one specified object | Listing, reading, writing |
+
+The exchange never grants access to another Project's bucket, and the credentials expire when the requested lifetime ends.
+
+The human-readable output is a Python example that passes all three temporary values directly to boto3. It sets the returned endpoint and region, SigV4 signing, path-style addressing, and connection timeouts, and the closing lines match the selected operation. For the default `upload` scope it uses boto3's managed `upload_file`, which can switch to multipart uploads for large files:
 
 ```python
 import boto3
@@ -188,6 +199,43 @@ export EBS_S3_ENDPOINT='https://s3.example.test'
 
 For automation, `--json` returns the API fields as JSON. Direct evaluation with `eval` is not recommended; shell output is intended for inspection or a carefully controlled shell.
 
+## List objects
+
+Exchange for `list` credentials and fetch exactly one bounded page of objects:
+
+```sh
+ebs s3 ls 12345678-1234-5678-1234-567812345678
+ebs s3 ls 12345678-1234-5678-1234-567812345678 --prefix run/ --limit 500 --json
+```
+
+The page size is 100 by default and `--limit` accepts 1 through 1000. The command never lists all buckets and never fetches unbounded pages. The table shows each object key, size in bytes, and last-modified time. When the store reports another page, the output shows the continuation token to pass to the next call as `--cursor TOKEN`; otherwise there is nothing more in this result set.
+
+`--json` writes the bucket, effective prefix, page limit, and the objects as `key`, `size`, and `last_modified` (UTC ISO-8601). The `next_cursor` field appears only when the server returned a continuation token.
+
+## Download an object
+
+Exchange for `download` credentials, then stream one object to a local file:
+
+```sh
+ebs s3 download 12345678-1234-5678-1234-567812345678 run/data.fits ./data.fits
+```
+
+The object body is streamed to an owner-only temporary file in the destination directory and renamed into place only after the transfer completes, so a partial download never masquerades as a complete file. A destination that already exists is refused unless you pass `--force`, and a destination that is a symbolic link is always refused, even with `--force`, so nothing is written through the link.
+
+Failures clean up the temporary file and print only that the download failed; temporary credentials and S3 exception details are never shown. Successful output contains only the `s3://bucket/key` source and the local destination.
+
+## Delete one object
+
+Exchange for `delete` credentials and remove exactly one object:
+
+```sh
+ebs s3 rm 12345678-1234-5678-1234-567812345678 run/data.fits
+```
+
+Attached to a terminal, the command asks for confirmation naming the key and trigger before any credential is requested. In scripts or other noninteractive sessions, deletion requires `--yes`; without it the command refuses and requests nothing. Prefixes and recursive trees are never deleted — only the exact key you name.
+
+Successful output contains only the `s3://bucket/key` target and the deleted status.
+
 ## One-object upload URLs
 
 Generate a presigned PUT URL for one object key:
@@ -217,7 +265,7 @@ ebs s3 upload 12345678-1234-5678-1234-567812345678 ./data.fits --key incoming/ru
 
 The default object key is the local file name. Keys must be relative, at most 1024 UTF-8 bytes, and cannot contain empty, `.` or `..` path segments.
 
-The CLI requests temporary scoped credentials, then gives boto3's managed `upload_file` the local path, returned bucket, and derived object key. The client uses the returned endpoint and region, all three temporary values, SigV4, path-style addressing, and bounded connection timeouts. Managed upload supports multipart transfers without loading the whole file into memory.
+The CLI requests temporary scoped credentials for the `upload` operation, then gives boto3's managed `upload_file` the local path, returned bucket, and derived object key. The client uses the returned endpoint and region, all three temporary values, SigV4, path-style addressing, and bounded connection timeouts. Managed upload supports multipart transfers without loading the whole file into memory.
 
 The local file never goes to the EBS API, and the EBS bearer token never goes to S3. This command does not request or display a presigned URL. Successful output contains only the `s3://bucket/key` target and status. Temporary credentials stay out of both success and failure output.
 
@@ -231,10 +279,13 @@ ebs events list 12345678-1234-5678-1234-567812345678 --json
 ebs projects list --json
 ebs projects show --json
 ebs s3 credentials 12345678-1234-5678-1234-567812345678 --json
+ebs s3 ls 12345678-1234-5678-1234-567812345678 --json
+ebs s3 download 12345678-1234-5678-1234-567812345678 run/data.fits ./data.fits --json
+ebs s3 rm 12345678-1234-5678-1234-567812345678 run/data.fits --yes --json
 ebs s3 upload 12345678-1234-5678-1234-567812345678 ./data.fits --json
 ```
 
-JSON goes to stdout with sorted keys. Diagnostics go to stderr and failures return a nonzero status. Credential JSON intentionally contains secrets. Upload JSON contains the target and success status, never temporary credentials or a signed URL.
+JSON goes to stdout with sorted keys. Diagnostics go to stderr and failures return a nonzero status. Credential JSON intentionally contains secrets. Object-command JSON contains only targets, paths, page data, and success status — never temporary credentials or a signed URL.
 
 ## Development
 
@@ -254,6 +305,9 @@ uv run ebs events list --help
 uv run ebs s3 credentials --help
 uv run ebs s3 upload-url --help
 uv run ebs s3 upload --help
+uv run ebs s3 ls --help
+uv run ebs s3 download --help
+uv run ebs s3 rm --help
 uv build
 ```
 

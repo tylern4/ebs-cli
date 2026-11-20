@@ -17,7 +17,7 @@ def test_boto3_client_uses_scoped_credentials_sigv4_path_style_and_timeouts(
     path.write_bytes(b"local-test-data")
     s3_client = Mock()
     factory = Mock(return_value=s3_client)
-    monkeypatch.setattr("ebs_cli.uploads.boto3.client", factory)
+    monkeypatch.setattr("ebs_cli.s3ops.boto3.client", factory)
 
     upload_file(credentials, path, "multipart/run.fits")
 
@@ -54,7 +54,7 @@ def test_boto3_service_failure_does_not_expose_temporary_credentials(
         },
         "PutObject",
     )
-    monkeypatch.setattr("ebs_cli.uploads.boto3.client", Mock(return_value=s3_client))
+    monkeypatch.setattr("ebs_cli.s3ops.boto3.client", Mock(return_value=s3_client))
 
     with pytest.raises(CLIError) as caught:
         upload_file(credentials, path, "data.fits")
@@ -74,7 +74,7 @@ def test_boto3_connection_failure_has_safe_actionable_error(
     path = tmp_path / "data.fits"
     path.write_bytes(b"local-test-data")
     factory = Mock(side_effect=EndpointConnectionError(endpoint_url=credentials.endpoint_url))
-    monkeypatch.setattr("ebs_cli.uploads.boto3.client", factory)
+    monkeypatch.setattr("ebs_cli.s3ops.boto3.client", factory)
 
     with pytest.raises(CLIError, match="Check the file and network"):
         upload_file(credentials, path, "data.fits")
@@ -88,7 +88,7 @@ def test_managed_upload_failure_does_not_return_success(
     path.write_bytes(b"local-test-data")
     s3_client = Mock()
     s3_client.upload_file.side_effect = OSError("source changed during multipart upload")
-    monkeypatch.setattr("ebs_cli.uploads.boto3.client", Mock(return_value=s3_client))
+    monkeypatch.setattr("ebs_cli.s3ops.boto3.client", Mock(return_value=s3_client))
 
     with pytest.raises(CLIError) as caught:
         upload_file(credentials, path, "data.fits")
