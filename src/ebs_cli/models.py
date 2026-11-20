@@ -87,6 +87,9 @@ class S3Credentials(BaseModel):
     secret_access_key: str = Field(min_length=1, repr=False)
     session_token: str = Field(min_length=1, repr=False)  # noqa: B105
     expires_at: datetime
+    # Core's echo of the requested capability; the default keeps parsing
+    # tolerant of a backend that predates the echo.
+    operation: Literal["upload", "list", "download", "delete"] = "upload"
 
     @field_validator(
         "bucket", "endpoint_url", "region", "access_key_id", "secret_access_key", "session_token"
