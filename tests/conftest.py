@@ -114,6 +114,10 @@ class FakeAPI:
         self.calls.append(("set_trigger_enabled", trigger_id, enabled))
         return self.trigger
 
+    def delete_trigger(self, trigger_id: UUID) -> None:
+        self.calls.append(("delete_trigger", trigger_id))
+        return None
+
     def list_events(self, trigger_id: UUID, **kwargs: Any) -> CursorPage[Event]:
         self.calls.append(("list_events", trigger_id, kwargs))
         return self.event_page

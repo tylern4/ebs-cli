@@ -130,6 +130,7 @@ class EBSClient:
         headers: dict[str, str] | None = None,
         sensitive: bool = False,
         project_scoped: bool = True,
+        allow_empty: bool = False,
     ) -> Any:
         try:
             response = self._http.request(
@@ -143,6 +144,8 @@ class EBSClient:
             ) from exc
 
         if response.is_success:
+            if allow_empty and not response.content:
+                return None
             try:
                 return response.json()
             except ValueError as exc:
@@ -218,6 +221,10 @@ class EBSClient:
 
     def set_trigger_enabled(self, trigger_id: UUID, enabled: bool) -> Trigger:
         return _parse(Trigger, self._request("PATCH", f"/triggers/{trigger_id}", json={"enabled": enabled}))
+
+    def delete_trigger(self, trigger_id: UUID) -> None:
+        """Delete one trigger. The server owns cascade behavior and authorization."""
+        self._request("DELETE", f"/triggers/{trigger_id}", allow_empty=True)
 
     def list_events(
         self,

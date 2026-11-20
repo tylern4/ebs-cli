@@ -428,6 +428,45 @@ def triggers_disable(
     _set_enabled(ctx, trigger_ref, False, json_output)
 
 
+@triggers_app.command("delete")
+@guarded
+def triggers_delete(
+    ctx: typer.Context,
+    trigger_ref: TriggerRefArgument,
+    yes: Annotated[bool, typer.Option("--yes", help="Skip the interactive confirmation.")] = False,
+    json_output: JSONOption = False,
+) -> None:
+    """Delete a trigger by ID or exact name, together with its event and job history."""
+    if not yes and not _stdin_is_interactive():
+        raise CLIError("Pass --yes to delete a trigger from a noninteractive session.", exit_code=2)
+    with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
+        trigger = client.get_trigger(trigger_id)
+        if not json_output:
+            project_label = trigger.group_name or trigger.group_id
+            console.print(
+                f"Trigger '{trigger.name}' (ID {trigger.id}) in Project {project_label}.",
+                markup=False,
+            )
+        if not yes:
+            confirmed = typer.confirm(
+                "Permanently delete this trigger and its event and job history?",
+                default=False,
+                err=json_output,
+            )
+            if not confirmed:
+                if json_output:
+                    print_error("Deletion cancelled. Nothing was deleted.")
+                else:
+                    console.print("Deletion cancelled. Nothing was deleted.", markup=False)
+                raise typer.Exit(1)
+        client.delete_trigger(trigger_id)
+    if json_output:
+        print_json(_trigger_json(trigger))
+    else:
+        _show_trigger(trigger, heading="Trigger deleted")
+
+
 @events_app.command("list")
 @guarded
 def events_list(
