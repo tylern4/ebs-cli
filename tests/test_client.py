@@ -236,6 +236,46 @@ def test_projects_request_uses_bearer_without_group_header_and_parses_items() ->
     ]
 
 
+def test_count_triggers_sends_one_bounded_page_scoped_to_the_named_project() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path == "/api/v1/triggers"
+        assert request.method == "GET"
+        assert request.url.params["limit"] == "1"
+        assert request.url.params["offset"] == "0"
+        assert request.headers["X-Group"] == "dasrepo"
+        assert request.headers["Authorization"] == "Bearer ebs_transport-test-token"
+        return httpx.Response(200, json={"items": [], "total": 7, "limit": 1, "offset": 0})
+
+    # Even a client holding a different selected Project must count under the
+    # explicitly named Project, never the ambient one.
+    client = EBSClient(
+        "https://ebs.example.test",
+        "ebs_transport-test-token",
+        "physics",
+        transport=httpx.MockTransport(handler),
+    )
+    with client:
+        assert client.count_triggers("dasrepo") == 7
+
+    assert len(requests) == 1
+
+
+def test_count_triggers_denied_error_mentions_the_selected_project() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-Group"] == "nstaff"
+        return httpx.Response(403, json={"detail": "not permitted"})
+
+    client = EBSClient(
+        "https://ebs.example.test", "ebs_transport-test-token", None, transport=httpx.MockTransport(handler)
+    )
+    with client:
+        with pytest.raises(CLIError, match="Access denied for the selected Project"):
+            client.count_triggers("nstaff")
+
+
 def test_scoped_client_still_sends_group_header() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-Group"] == "physics"

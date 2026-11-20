@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 from ebs_cli import cli
 from ebs_cli.cli import Options, app
 from ebs_cli.config import load_token, save_project, save_token
+from ebs_cli.errors import CLIError
 from ebs_cli.models import OffsetPage, Project, Trigger
 
 CONFIG_ENV = "EBS_CONFIG"
@@ -25,6 +26,9 @@ class RecordingClient:
     """EBSClient stand-in that records constructor arguments and serves Projects."""
 
     last: "RecordingClient | None" = None
+    projects: list[Project] | None = None
+    totals: dict[str, int] = {}
+    fail_count_for: str | None = None
 
     def __init__(self, url: str, token: str, project: str | None = None, **kwargs: Any) -> None:
         self.url = url
@@ -41,11 +45,19 @@ class RecordingClient:
 
     def list_projects(self) -> list[Project]:
         self.calls.append(("list_projects",))
+        if RecordingClient.projects is not None:
+            return list(RecordingClient.projects)
         return [Project(name="zeta", role="user"), Project(name="alpha", role="maintainer")]
 
     def list_triggers(self, **kwargs: Any) -> OffsetPage[Any]:
         self.calls.append(("list_triggers", kwargs))
         return OffsetPage(items=[], total=0, limit=50, offset=0)
+
+    def count_triggers(self, project: str) -> int:
+        self.calls.append(("count_triggers", project))
+        if RecordingClient.fail_count_for == project:
+            raise CLIError("Access denied for the selected Project. not permitted")
+        return RecordingClient.totals.get(project, 0)
 
     def get_trigger(self, trigger_id: Any) -> Any:
         self.calls.append(("get_trigger", trigger_id))
@@ -55,6 +67,9 @@ class RecordingClient:
 @pytest.fixture
 def recording_client(monkeypatch: pytest.MonkeyPatch) -> type[RecordingClient]:
     monkeypatch.setattr(cli, "EBSClient", RecordingClient)
+    monkeypatch.setattr(RecordingClient, "projects", None)
+    monkeypatch.setattr(RecordingClient, "totals", {})
+    monkeypatch.setattr(RecordingClient, "fail_count_for", None)
     RecordingClient.last = None
     return RecordingClient
 
@@ -84,9 +99,108 @@ def test_projects_list_works_without_any_project_selection(
     assert "Role" in result.stdout
 
 
-def test_projects_list_json_is_stable_and_sorted(
+def test_projects_list_counts_triggers_per_project_in_request_order(
+    runner: CliRunner, recording_client: type[RecordingClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("EBS_PROJECT")
+    RecordingClient.totals = {"zeta": 3, "alpha": 12}
+
+    result = runner.invoke(app, ["projects", "list", "--json"], env={"COLUMNS": "120"})
+
+    assert result.exit_code == 0, result.output
+    assert RecordingClient.last is not None
+    # Counts are requested per listed Project, one bounded page each, in the
+    # same alphabetical order the table and JSON display.
+    assert RecordingClient.last.calls == [
+        ("list_projects",),
+        ("count_triggers", "alpha"),
+        ("count_triggers", "zeta"),
+    ]
+    assert json.loads(result.stdout) == {
+        "items": [
+            {"name": "alpha", "role": "maintainer", "trigger_count": 12},
+            {"name": "zeta", "role": "user", "trigger_count": 3},
+        ]
+    }
+
+
+def test_projects_list_table_shows_zero_and_large_counts_right_aligned(
+    runner: CliRunner, recording_client: type[RecordingClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("EBS_PROJECT")
+    RecordingClient.totals = {"alpha": 0, "zeta": 12345}
+
+    result = runner.invoke(app, ["projects", "list"], env={"COLUMNS": "120"})
+
+    assert result.exit_code == 0, result.output
+    assert "0" in result.stdout
+    assert "12345" in result.stdout
+    header_row = next(line for line in result.stdout.splitlines() if "Triggers" in line)
+    columns = [column.strip() for column in header_row.split("┃") if column.strip()]
+    assert columns == ["Project", "Role", "Triggers"]
+    for row in (line for line in result.stdout.splitlines() if "│" in line):
+        cells = [cell.strip() for cell in row.split("│") if cell.strip()]
+        if not cells or cells[0] not in {"alpha", "zeta"}:
+            continue
+        assert cells[-1].isdigit(), row
+
+
+def test_projects_list_never_counts_with_an_ambient_project(
     runner: CliRunner, recording_client: type[RecordingClient]
 ) -> None:
+    # The autouse fixture sets EBS_PROJECT=physics and a saved default is also
+    # present; neither may scope another row's trigger count.
+    save_project("saved-project")
+    RecordingClient.totals = {"alpha": 1, "zeta": 2}
+
+    result = runner.invoke(app, ["projects", "list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert RecordingClient.last is not None
+    assert RecordingClient.last.project is None
+    assert [call for call in RecordingClient.last.calls if call[0] == "count_triggers"] == [
+        ("count_triggers", "alpha"),
+        ("count_triggers", "zeta"),
+    ]
+
+
+def test_projects_list_empty_project_list_makes_no_count_requests(
+    runner: CliRunner, recording_client: type[RecordingClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("EBS_PROJECT")
+    RecordingClient.projects = []
+
+    result = runner.invoke(app, ["projects", "list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"items": []}
+    assert RecordingClient.last is not None
+    assert RecordingClient.last.calls == [("list_projects",)]
+
+    human = runner.invoke(app, ["projects", "list"])
+    assert human.exit_code == 0, human.output
+    assert "No Projects are associated with your account." in human.stdout
+
+
+def test_projects_list_count_failure_fails_with_project_context(
+    runner: CliRunner, recording_client: type[RecordingClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("EBS_PROJECT")
+    RecordingClient.fail_count_for = "zeta"
+
+    result = runner.invoke(app, ["projects", "list"])
+
+    assert result.exit_code == 1
+    assert "Could not count triggers in Project 'zeta'" in result.stderr
+    assert "Access denied for the selected Project" in result.stderr
+    # The failure surfaces instead of a fabricated zero count.
+    assert "Triggers" not in result.stdout
+
+
+def test_projects_list_json_is_stable_and_sorted(
+    runner: CliRunner, recording_client: type[RecordingClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("EBS_PROJECT")
     first = runner.invoke(app, ["projects", "list", "--json"])
     second = runner.invoke(app, ["projects", "list", "--json"])
 
@@ -94,7 +208,10 @@ def test_projects_list_json_is_stable_and_sorted(
     assert first.stdout == second.stdout
     assert first.stdout.startswith('{"items":')
     assert json.loads(first.stdout) == {
-        "items": [{"name": "alpha", "role": "maintainer"}, {"name": "zeta", "role": "user"}]
+        "items": [
+            {"name": "alpha", "role": "maintainer", "trigger_count": 0},
+            {"name": "zeta", "role": "user", "trigger_count": 0},
+        ]
     }
 
 

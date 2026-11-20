@@ -31,7 +31,7 @@ from ebs_cli.config import (
 )
 from ebs_cli.config import logout as remove_token
 from ebs_cli.errors import CLIError
-from ebs_cli.models import Event, S3Credentials, Trigger
+from ebs_cli.models import Event, Project, S3Credentials, Trigger
 from ebs_cli.output import console, print_error, print_json, print_panel, safe_text, text
 from ebs_cli.s3ops import delete_object, download_object, list_objects
 from ebs_cli.security import redacted_headers
@@ -220,19 +220,36 @@ def logout() -> None:
 @projects_app.command("list")
 @guarded
 def projects_list(ctx: typer.Context, json_output: JSONOption = False) -> None:
-    """List the Projects your account can access."""
+    """List the Projects your account can access, with per-Project trigger counts."""
     options = ctx.ensure_object(Options)
     with EBSClient(options.url, load_token(), None) as client:
         projects = client.list_projects()
-    ordered = sorted(projects, key=lambda item: item.name)
+        ordered = sorted(projects, key=lambda item: item.name)
+        counted: list[tuple[Project, int]] = []
+        for project in ordered:
+            try:
+                counted.append((project, client.count_triggers(project.name)))
+            except CLIError as exc:
+                raise CLIError(
+                    f"Could not count triggers in Project '{project.name}'. {exc}",
+                    exit_code=exc.exit_code,
+                ) from None
     if json_output:
-        print_json({"items": [{"name": project.name, "role": project.role} for project in ordered]})
+        print_json(
+            {
+                "items": [
+                    {"name": project.name, "role": project.role, "trigger_count": count}
+                    for project, count in counted
+                ]
+            }
+        )
         return
     table = Table(title="Projects")
     table.add_column("Project")
     table.add_column("Role")
-    for project in ordered:
-        table.add_row(text(project.name), text(project.role))
+    table.add_column("Triggers", justify="right")
+    for project, count in counted:
+        table.add_row(text(project.name), text(project.role), text(count))
     console.print(table)
     if ordered:
         console.print(

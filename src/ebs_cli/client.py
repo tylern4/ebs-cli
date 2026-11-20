@@ -127,11 +127,14 @@ class EBSClient:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
         sensitive: bool = False,
         project_scoped: bool = True,
     ) -> Any:
         try:
-            response = self._http.request(method, f"{API_PREFIX}{path}", params=params, json=json)
+            response = self._http.request(
+                method, f"{API_PREFIX}{path}", params=params, json=json, headers=headers
+            )
         except httpx.TimeoutException as exc:
             raise CLIError("Request timed out. Check the server URL and retry.") from exc
         except httpx.RequestError as exc:
@@ -192,6 +195,23 @@ class EBSClient:
         if name is not None:
             params["name"] = name
         return _parse(OffsetPage[Trigger], self._request("GET", "/triggers", params=params))
+
+    def count_triggers(self, project: str) -> int:
+        """Count every trigger in one explicitly named Project.
+
+        The count is the ``total`` of a single bounded ``limit=1, offset=0``
+        trigger listing, so only the total is retained rather than fetching
+        the Project's full trigger list. The Project
+        scope is sent as this request's ``X-Group`` header, which overrides
+        any client-level selection, so a saved or flag-selected Project is
+        never reused to count a different Project's triggers. Callers count
+        each listed Project by its exact name.
+        """
+        page = _parse(
+            OffsetPage[Trigger],
+            self._request("GET", "/triggers", params={"limit": 1, "offset": 0}, headers={"X-Group": project}),
+        )
+        return page.total
 
     def get_trigger(self, trigger_id: UUID) -> Trigger:
         return _parse(Trigger, self._request("GET", f"/triggers/{trigger_id}"))

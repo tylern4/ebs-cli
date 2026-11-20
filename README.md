@@ -36,6 +36,19 @@ ebs projects use PROJECT
 
 Use the exact Project name from the list. After this, plain commands work without flags or environment variables.
 
+The Project listing also shows a `Triggers` count per Project (`trigger_count` with `--json`), so you can see which Projects have triggers configured before listing them individually:
+
+```sh
+$ ebs projects list
+Projects
+┏━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━┓
+┃ Project ┃ Role        ┃ Triggers ┃
+┡━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━┩
+│ alpha   │ maintainer  │        2 │
+│ zeta    │ user        │        0 │
+└─────────┴─────────────┴──────────┘
+```
+
 A few first commands:
 
 ```sh

@@ -55,7 +55,7 @@ ebs projects list
 ebs projects list --json
 ```
 
-The table shows each Project name and your role in it. Save a default after checking the exact name against the list:
+The table shows each Project name, your role in it, and how many triggers the Project has configured (a right-aligned `Triggers` column, including `0`); `ebs projects list --json` reports the same value as `trigger_count` on each item. Save a default after checking the exact name against the list:
 
 ```sh
 ebs projects use physics
