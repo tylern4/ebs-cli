@@ -423,7 +423,7 @@ def test_trigger_argument_help_names_the_reference(runner: CliRunner, argv: list
 
 
 def test_list_help_shows_the_name_filter(runner: CliRunner) -> None:
-    result = runner.invoke(app, ["triggers", "list", "--help"])
+    result = runner.invoke(app, ["triggers", "list", "--help"], env={"COLUMNS": "200"})
 
     assert result.exit_code == 0
     assert "--name" in result.stdout
