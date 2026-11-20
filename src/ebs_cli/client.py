@@ -22,6 +22,19 @@ from ebs_cli.security import redact_secrets
 
 API_PREFIX = "/api/v1"
 
+MAX_TRIGGER_NAME_BYTES = 255
+NAME_LOOKUP_LIMIT = 100
+AMBIGUITY_SAMPLE_LIMIT = 5
+
+
+def validate_trigger_name(value: str) -> str:
+    """Validate a trigger name used as a listing filter or reference."""
+    if not value or len(value.encode("utf-8")) > MAX_TRIGGER_NAME_BYTES:
+        raise CLIError("Trigger name must be 1 to 255 UTF-8 bytes.", exit_code=2)
+    if any(not character.isprintable() for character in value):
+        raise CLIError("Trigger name cannot contain control characters.", exit_code=2)
+    return value
+
 
 def normalize_server_url(value: str) -> str:
     value = value.strip().rstrip("/")
@@ -166,11 +179,18 @@ class EBSClient:
         return list(page.items)
 
     def list_triggers(
-        self, *, limit: int = 50, offset: int = 0, enabled: bool | None = None
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        enabled: bool | None = None,
+        name: str | None = None,
     ) -> OffsetPage[Trigger]:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if enabled is not None:
             params["enabled"] = enabled
+        if name is not None:
+            params["name"] = name
         return _parse(OffsetPage[Trigger], self._request("GET", "/triggers", params=params))
 
     def get_trigger(self, trigger_id: UUID) -> Trigger:
@@ -221,6 +241,49 @@ class EBSClient:
             sensitive=True,
         )
         return _parse(UploadURL, body, secret_response=True)
+
+
+def resolve_trigger_reference(client: EBSClient, reference: str) -> UUID:
+    """Resolve a typed trigger reference to one trigger ID in the client's Project.
+
+    A syntactically valid UUID is returned without any name lookup so the
+    direct ``GET /triggers/{uuid}`` flow is unchanged. Any other nonempty
+    reference is fetched with one bounded, name-filtered listing and matched
+    exactly and case-sensitively against the returned trigger names. A match
+    is accepted only when the whole candidate set fits in that bounded page,
+    so a duplicate beyond the page can never be silently ignored. Zero,
+    multiple, or truncated candidate sets fail closed without a request to
+    any other Project.
+    """
+    try:
+        return UUID(reference)
+    except ValueError:
+        pass
+    name = validate_trigger_name(reference)
+    page = client.list_triggers(name=name, limit=NAME_LOOKUP_LIMIT, offset=0)
+    matches = [trigger for trigger in page.items if trigger.name == name]
+    if len(matches) > 1:
+        sample = ", ".join(str(trigger.id) for trigger in matches[:AMBIGUITY_SAMPLE_LIMIT])
+        extra = len(matches) - AMBIGUITY_SAMPLE_LIMIT
+        suffix = f" and {extra} more" if extra > 0 else ""
+        raise CLIError(
+            f"Trigger name '{name}' is ambiguous in the selected Project: "
+            f"{len(matches)} triggers share it ({sample}{suffix}). Use a trigger ID instead.",
+            exit_code=2,
+        )
+    if page.total > len(page.items):
+        raise CLIError(
+            f"The name '{name}' resembles {page.total} triggers in the selected Project, "
+            "more than one bounded page can inspect. Use a trigger ID instead.",
+            exit_code=2,
+        )
+    if len(matches) == 1:
+        return matches[0].id
+    raise CLIError(
+        f"No trigger named '{name}' exists in the selected Project. "
+        f"Run 'ebs triggers list --name {name}' to see similar names.",
+        exit_code=2,
+    )
 
 
 def _parse(model: Any, value: Any, *, secret_response: bool = False) -> Any:

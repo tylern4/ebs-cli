@@ -107,20 +107,35 @@ Without any of the three, API commands fail with guidance to run `ebs projects l
 
 ## Triggers
 
-List one page, show a trigger, or change its state:
+List one page, filter by name, show a trigger, or change its state:
 
 ```sh
 ebs triggers list --limit 50 --offset 0
 ebs triggers list --enabled
 ebs triggers list --disabled
-ebs triggers show 12345678-1234-5678-1234-567812345678
-ebs triggers disable 12345678-1234-5678-1234-567812345678
+ebs triggers list --name data
+ebs triggers show data-ready
+ebs triggers disable data-ready
 ebs triggers enable 12345678-1234-5678-1234-567812345678
 ```
 
-Pages have at most 100 triggers. Use the reported total and `--offset` to request another page.
+Pages have at most 100 triggers. Use the reported total and `--offset` to request another page. `--name` is a case-insensitive substring filter that stays within the selected Project and one bounded page.
+
+### Trigger references
+
+Every command that names a trigger — `triggers show`, `enable`, and `disable`, `events list`, and every `s3` command — accepts a `TRIGGER_REF`: either the trigger's ID (UUID) or its exact, case-sensitive name in the selected or default Project:
+
+```sh
+ebs triggers show data-ready
+ebs events list data-ready
+ebs s3 ls data-ready --prefix run/
+```
+
+A syntactically valid UUID is used directly, with no name lookup and unchanged behavior. Any other reference is resolved with one bounded, Project-scoped listing filtered by that name, and must match exactly: no partial or case-insensitive match is ever chosen silently. Zero matches fail with guidance to run `ebs triggers list --name REF`; a name shared by several triggers fails closed and lists their trigger IDs so you can pick one; when too many triggers resemble the name to inspect in one bounded page, use the trigger ID instead. Resolution never contacts another Project and never displays credentials or signed URLs. `--json` output is identical for both reference forms.
 
 ## Events and jobs
+
+The trigger can be a UUID or an exact name (see [Trigger references](#trigger-references)):
 
 ```sh
 ebs events list 12345678-1234-5678-1234-567812345678
@@ -301,6 +316,9 @@ uv run ebs projects list --help
 uv run ebs projects use --help
 uv run ebs projects show --help
 uv run ebs triggers list --help
+uv run ebs triggers show --help
+uv run ebs triggers enable --help
+uv run ebs triggers disable --help
 uv run ebs events list --help
 uv run ebs s3 credentials --help
 uv run ebs s3 upload-url --help

@@ -5,7 +5,6 @@ from enum import StrEnum
 from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
-from uuid import UUID
 
 import typer
 from rich.table import Table
@@ -15,9 +14,11 @@ from ebs_cli import __version__
 from ebs_cli.client import (
     EBSClient,
     normalize_server_url,
+    resolve_trigger_reference,
     validate_cursor,
     validate_object_key,
     validate_prefix,
+    validate_trigger_name,
 )
 from ebs_cli.config import (
     DEFAULT_URL,
@@ -60,6 +61,13 @@ DurationOption = Annotated[
     int,
     typer.Option(
         "--duration-seconds", min=900, max=3600, help="Credential lifetime, from 900 to 3600 seconds."
+    ),
+]
+TriggerRefArgument = Annotated[
+    str,
+    typer.Argument(
+        metavar="TRIGGER_REF",
+        help="Trigger ID or exact trigger name in the selected Project.",
     ),
 ]
 
@@ -288,11 +296,19 @@ def triggers_list(
     enabled: Annotated[
         bool | None, typer.Option("--enabled/--disabled", help="Filter by trigger state.")
     ] = None,
+    name: Annotated[
+        str | None,
+        typer.Option(help="Only triggers whose name contains this text, case-insensitively."),
+    ] = None,
     json_output: JSONOption = False,
 ) -> None:
     """List one bounded page of triggers in the selected Project."""
+    name_filter = validate_trigger_name(name) if name is not None else None
     with api_client(ctx) as client:
-        page = client.list_triggers(limit=limit, offset=offset, enabled=enabled)
+        request: dict[str, Any] = {"limit": limit, "offset": offset, "enabled": enabled}
+        if name_filter is not None:
+            request["name"] = name_filter
+        page = client.list_triggers(**request)
     if json_output:
         print_json(page.model_dump(mode="json"))
         return
@@ -354,9 +370,12 @@ def _show_trigger(trigger: Trigger, *, heading: str = "Trigger") -> None:
 
 @triggers_app.command("show")
 @guarded
-def triggers_show(ctx: typer.Context, trigger_id: UUID, json_output: JSONOption = False) -> None:
-    """Show one trigger."""
+def triggers_show(
+    ctx: typer.Context, trigger_ref: TriggerRefArgument, json_output: JSONOption = False
+) -> None:
+    """Show one trigger by ID or exact name."""
     with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
         trigger = client.get_trigger(trigger_id)
     if json_output:
         print_json(_trigger_json(trigger))
@@ -364,8 +383,9 @@ def triggers_show(ctx: typer.Context, trigger_id: UUID, json_output: JSONOption 
         _show_trigger(trigger)
 
 
-def _set_enabled(ctx: typer.Context, trigger_id: UUID, enabled: bool, json_output: bool) -> None:
+def _set_enabled(ctx: typer.Context, trigger_ref: str, enabled: bool, json_output: bool) -> None:
     with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
         trigger = client.set_trigger_enabled(trigger_id, enabled)
     if json_output:
         print_json(_trigger_json(trigger))
@@ -375,38 +395,43 @@ def _set_enabled(ctx: typer.Context, trigger_id: UUID, enabled: bool, json_outpu
 
 @triggers_app.command("enable")
 @guarded
-def triggers_enable(ctx: typer.Context, trigger_id: UUID, json_output: JSONOption = False) -> None:
-    """Enable a trigger and start its service."""
-    _set_enabled(ctx, trigger_id, True, json_output)
+def triggers_enable(
+    ctx: typer.Context, trigger_ref: TriggerRefArgument, json_output: JSONOption = False
+) -> None:
+    """Enable a trigger by ID or exact name and start its service."""
+    _set_enabled(ctx, trigger_ref, True, json_output)
 
 
 @triggers_app.command("disable")
 @guarded
-def triggers_disable(ctx: typer.Context, trigger_id: UUID, json_output: JSONOption = False) -> None:
-    """Disable a trigger and stop its service."""
-    _set_enabled(ctx, trigger_id, False, json_output)
+def triggers_disable(
+    ctx: typer.Context, trigger_ref: TriggerRefArgument, json_output: JSONOption = False
+) -> None:
+    """Disable a trigger by ID or exact name and stop its service."""
+    _set_enabled(ctx, trigger_ref, False, json_output)
 
 
 @events_app.command("list")
 @guarded
 def events_list(
     ctx: typer.Context,
-    trigger_id: UUID,
+    trigger_ref: TriggerRefArgument,
     limit: Annotated[int, typer.Option(min=1, max=200, help="Maximum events to fetch.")] = 50,
     cursor: Annotated[str | None, typer.Option(help="Opaque cursor returned by an earlier page.")] = None,
     status: Annotated[str | None, typer.Option(help="Filter by event status.")] = None,
     source: Annotated[str | None, typer.Option(help="Filter by event source.")] = None,
     json_output: JSONOption = False,
 ) -> None:
-    """List one bounded page of events and associated jobs."""
+    """List one bounded page of events and associated jobs for a trigger."""
     with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
         page = client.list_events(trigger_id, limit=limit, cursor=cursor, status=status, source=source)
     if json_output:
         body = page.model_dump(mode="json")
         body["items"] = [_event_json(event) for event in page.items]
         print_json(body)
         return
-    table = Table(title=f"Events for {trigger_id}")
+    table = Table(title=Text(f"Events for {trigger_ref}"))
     for column in ("Received", "Event ID", "Status", "Source", "Job ID", "Job status", "Failure"):
         table.add_column(column)
     for event in page.items:
@@ -487,7 +512,7 @@ def _python_instructions(credentials: S3Credentials, operation: S3Operation) -> 
 @guarded
 def s3_credentials(
     ctx: typer.Context,
-    trigger_id: UUID,
+    trigger_ref: TriggerRefArgument,
     duration_seconds: DurationOption = 900,
     operation: Annotated[
         S3Operation,
@@ -502,6 +527,7 @@ def s3_credentials(
     if json_output and shell:
         raise CLIError("Choose either --json or --shell, not both.", exit_code=2)
     with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
         credentials = client.s3_credentials(
             trigger_id, duration_seconds=duration_seconds, operation=operation.value
         )
@@ -526,7 +552,7 @@ def s3_credentials(
 @guarded
 def s3_upload_url(
     ctx: typer.Context,
-    trigger_id: UUID,
+    trigger_ref: TriggerRefArgument,
     key: str,
     duration_seconds: DurationOption = 900,
     show_url: Annotated[
@@ -538,6 +564,7 @@ def s3_upload_url(
     """Create a presigned PUT URL for one object."""
     object_key = validate_object_key(key)
     with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
         upload = client.s3_upload_url(trigger_id, object_key, duration_seconds=duration_seconds)
     displayed_url = upload.url if show_url else "[signed URL redacted]"
     headers = redacted_headers(upload.headers, reveal=show_url)
@@ -566,7 +593,7 @@ def s3_upload_url(
 @guarded
 def s3_upload(
     ctx: typer.Context,
-    trigger_id: UUID,
+    trigger_ref: TriggerRefArgument,
     file: Annotated[Path, typer.Argument(help="Local file to stream directly to S3.")],
     key: Annotated[str | None, typer.Option(help="Object key. Defaults to the local file name.")] = None,
     duration_seconds: DurationOption = 900,
@@ -581,6 +608,7 @@ def s3_upload(
         raise CLIError(f"Local file does not exist or is not a regular file: {file}", exit_code=2)
     object_key = validate_object_key(key if key is not None else file.name)
     with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
         credentials = client.s3_credentials(
             trigger_id, duration_seconds=duration_seconds, operation=S3Operation.UPLOAD.value
         )
@@ -624,7 +652,7 @@ def _stdin_is_interactive() -> bool:
 @guarded
 def s3_ls(
     ctx: typer.Context,
-    trigger_id: UUID,
+    trigger_ref: TriggerRefArgument,
     prefix: Annotated[str | None, typer.Option(help="Only keys that begin with this prefix.")] = None,
     limit: Annotated[
         int, typer.Option(min=1, max=1000, help="Maximum objects to fetch, from 1 to 1000.")
@@ -638,6 +666,7 @@ def s3_ls(
     prefix_text = validate_prefix(prefix or "")
     cursor_text = validate_cursor(cursor) if cursor is not None else None
     with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
         credentials = client.s3_credentials(
             trigger_id, duration_seconds=900, operation=S3Operation.LIST.value
         )
@@ -676,7 +705,7 @@ def s3_ls(
 @guarded
 def s3_download(
     ctx: typer.Context,
-    trigger_id: UUID,
+    trigger_ref: TriggerRefArgument,
     key: Annotated[str, typer.Argument(help="Object key in the trigger's bucket.")],
     file: Annotated[Path, typer.Argument(help="Local destination path for the object.")],
     force: Annotated[
@@ -688,6 +717,7 @@ def s3_download(
     object_key = validate_object_key(key)
     _validate_download_destination(file, force=force)
     with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
         credentials = client.s3_credentials(
             trigger_id, duration_seconds=900, operation=S3Operation.DOWNLOAD.value
         )
@@ -711,7 +741,7 @@ def s3_download(
 @guarded
 def s3_rm(
     ctx: typer.Context,
-    trigger_id: UUID,
+    trigger_ref: TriggerRefArgument,
     key: Annotated[str, typer.Argument(help="Exact object key to delete.")],
     yes: Annotated[bool, typer.Option("--yes", help="Skip the interactive confirmation.")] = False,
     json_output: JSONOption = False,
@@ -722,12 +752,13 @@ def s3_rm(
         if not _stdin_is_interactive():
             raise CLIError("Pass --yes to delete from a noninteractive session.", exit_code=2)
         confirmed = typer.confirm(
-            f"Permanently delete {object_key!r} from trigger {trigger_id}'s bucket?", default=False
+            f"Permanently delete {object_key!r} from trigger {trigger_ref}'s bucket?", default=False
         )
         if not confirmed:
             console.print("Deletion cancelled. Nothing was deleted.", markup=False)
             raise typer.Exit(1)
     with api_client(ctx) as client:
+        trigger_id = resolve_trigger_reference(client, trigger_ref)
         credentials = client.s3_credentials(
             trigger_id, duration_seconds=900, operation=S3Operation.DELETE.value
         )
