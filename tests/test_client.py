@@ -297,6 +297,7 @@ def test_list_string_detail_renders_verbatim() -> None:
     """Core's pipeline render gate 422s with a list of plain sentences
     (issues/192, API-09): the CLI renders them instead of blanking the
     reason entirely."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             422,
@@ -319,6 +320,7 @@ def test_list_string_detail_renders_verbatim() -> None:
 def test_validation_object_detail_still_renders_msg() -> None:
     """Pydantic validation 422s carry {loc, msg, type} objects; the CLI
     keeps rendering their msg (joined like the string shape)."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             422,

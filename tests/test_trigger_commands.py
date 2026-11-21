@@ -75,7 +75,7 @@ def test_version_and_bare_help_succeed(runner: CliRunner) -> None:
     bare = runner.invoke(app, [])
 
     assert version.exit_code == 0
-    assert version.stdout.strip() == "0.1.0"
+    assert version.stdout.strip() == "0.1.1"
     assert bare.exit_code == 0
     assert "Usage:" in bare.stdout
 
