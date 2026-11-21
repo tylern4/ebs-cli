@@ -1,8 +1,11 @@
 import json
+from io import StringIO
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from conftest import SIGNED_URL, TRIGGER_ID, FakeAPI
+from rich.console import Console
 from typer.testing import CliRunner
 
 from ebs_cli.cli import app
@@ -130,6 +133,43 @@ def test_direct_upload_uses_credentials_and_hides_every_temporary_value(
     for secret in ("temporary-access", "temporary-secret", "temporary-session", SIGNED_URL):
         assert secret not in result.stdout
         assert secret not in result.stderr
+
+
+def test_direct_upload_tty_shows_progress_through_existing_managed_transfer(
+    runner: CliRunner, fake_api: FakeAPI, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "test.fits"
+    path.write_bytes(b"fits-data")
+    progress_output = StringIO()
+    monkeypatch.setattr(
+        "ebs_cli.uploads.error_console",
+        Console(file=progress_output, force_terminal=True, width=100),
+    )
+    calls: list[tuple[str, str, str]] = []
+
+    def upload(filename: str, bucket: str, key: str, **options: object) -> None:
+        calls.append((filename, bucket, key))
+        with open(filename, "rb") as source:
+            while chunk := source.read(3):
+                options["Callback"](len(chunk))
+
+    monkeypatch.setattr("ebs_cli.s3ops.boto3.client", Mock(return_value=Mock(upload_file=upload)))
+
+    result = runner.invoke(app, ["s3", "upload", str(TRIGGER_ID), str(path)])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(str(path), "ebs-physics", "test.fits")]
+    assert fake_api.calls == [
+        ("s3_credentials", TRIGGER_ID, {"duration_seconds": 900, "operation": "upload"})
+    ]
+    assert result.stdout == "Uploaded test.fits to s3://ebs-physics/test.fits.\n"
+    assert result.stderr == ""
+    assert "Uploading test.fits" in progress_output.getvalue()
+    assert "100%" in progress_output.getvalue()
+    assert "9/9 bytes" in progress_output.getvalue()
+    for secret in ("temporary-access", "temporary-secret", "temporary-session", SIGNED_URL):
+        assert secret not in result.output
+        assert secret not in progress_output.getvalue()
 
 
 def test_direct_upload_json_contains_only_target_and_success(
