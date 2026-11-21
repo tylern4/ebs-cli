@@ -35,7 +35,7 @@ Tests use mocked HTTP transports and temporary config files. They do not contact
 
 ## Continuous integration
 
-GitHub Actions runs the same checks on every push to `main`, every pull request, and on manual dispatch. Each run uses Ubuntu with Python 3.11 and 3.14 and installs the locked dependencies with `uv sync --locked`, then:
+GitHub Actions runs the same checks on every push to `main`, every pull request, and on manual dispatch. Each run uses Ubuntu with Python 3.11, 3.12, 3.13, and 3.14 and installs the locked dependencies with `uv sync --locked`, then:
 
 - runs the full pytest suite,
 - checks Ruff lint, formatting, and import ordering,
