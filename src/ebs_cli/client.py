@@ -334,6 +334,16 @@ def _response_detail(response: httpx.Response) -> str:
     if isinstance(detail, str):
         return detail
     if isinstance(detail, list):
-        messages = [str(item.get("msg")) for item in detail[:3] if isinstance(item, dict) and item.get("msg")]
+        # FastAPI's list detail arrives in two shapes: the pipeline render
+        # gate's plain sentences (list[str]) and pydantic validation
+        # objects ({loc, msg, type}). Strings render verbatim; validation
+        # objects render their msg. (issues/192, API-09: the render gate's
+        # reason used to be blanked entirely here.)
+        messages = []
+        for item in detail[:3]:
+            if isinstance(item, str):
+                messages.append(item)
+            elif isinstance(item, dict) and item.get("msg"):
+                messages.append(str(item["msg"]))
         return "; ".join(messages)
     return ""

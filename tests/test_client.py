@@ -293,6 +293,46 @@ def test_scoped_client_still_sends_group_header() -> None:
     assert page.items == []
 
 
+def test_list_string_detail_renders_verbatim() -> None:
+    """Core's pipeline render gate 422s with a list of plain sentences
+    (issues/192, API-09): the CLI renders them instead of blanking the
+    reason entirely."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "detail": [
+                    "outputs.subprocess: 'subprocess' is not an allowed output plugin",
+                    "line 3: 'env(' is not allowed in a filter snippet",
+                ]
+            },
+        )
+
+    client = EBSClient(
+        "https://ebs.example.test", "ebs_transport-test-token", None, transport=httpx.MockTransport(handler)
+    )
+    with client:
+        with pytest.raises(CLIError, match="not an allowed output plugin.*not allowed in a filter snippet"):
+            client.list_projects()
+
+
+def test_validation_object_detail_still_renders_msg() -> None:
+    """Pydantic validation 422s carry {loc, msg, type} objects; the CLI
+    keeps rendering their msg (joined like the string shape)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={"detail": [{"loc": ["body", "version"], "msg": "version required", "type": "missing"}]},
+        )
+
+    client = EBSClient(
+        "https://ebs.example.test", "ebs_transport-test-token", None, transport=httpx.MockTransport(handler)
+    )
+    with client:
+        with pytest.raises(CLIError, match="version required"):
+            client.list_projects()
+
+
 def test_projects_access_denied_error_is_not_project_scoped() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"detail": "not permitted"})
