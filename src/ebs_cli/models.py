@@ -106,6 +106,9 @@ class Project(BaseModel):
 
     name: str = Field(min_length=1)
     role: str = Field(min_length=1)
+    # Present when the API supported the opt-in set-based count. Older APIs
+    # omit it and the CLI retains its per-Project compatibility fallback.
+    trigger_count: int | None = Field(default=None, ge=0)
 
     @field_validator("name", "role")
     @classmethod

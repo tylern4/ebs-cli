@@ -43,8 +43,8 @@ class RecordingClient:
     def __exit__(self, *args: Any) -> None:
         return None
 
-    def list_projects(self) -> list[Project]:
-        self.calls.append(("list_projects",))
+    def list_projects(self, *, include_trigger_counts: bool = False) -> list[Project]:
+        self.calls.append(("list_projects_with_counts" if include_trigger_counts else "list_projects",))
         if RecordingClient.projects is not None:
             return list(RecordingClient.projects)
         return [Project(name="zeta", role="user"), Project(name="alpha", role="maintainer")]
@@ -112,7 +112,7 @@ def test_projects_list_counts_triggers_per_project_in_request_order(
     # Counts are requested per listed Project, one bounded page each, in the
     # same alphabetical order the table and JSON display.
     assert RecordingClient.last.calls == [
-        ("list_projects",),
+        ("list_projects_with_counts",),
         ("count_triggers", "alpha"),
         ("count_triggers", "zeta"),
     ]
@@ -120,6 +120,27 @@ def test_projects_list_counts_triggers_per_project_in_request_order(
         "items": [
             {"name": "alpha", "role": "maintainer", "trigger_count": 12},
             {"name": "zeta", "role": "user", "trigger_count": 3},
+        ]
+    }
+
+
+def test_projects_list_uses_batched_counts_without_per_project_requests(
+    runner: CliRunner, recording_client: type[RecordingClient], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("EBS_PROJECT")
+    RecordingClient.projects = [
+        Project(name=f"synthetic-{index:02d}", role="user", trigger_count=index)
+        for index in reversed(range(41))
+    ]
+
+    result = runner.invoke(app, ["projects", "list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert RecordingClient.last is not None
+    assert RecordingClient.last.calls == [("list_projects_with_counts",)]
+    assert json.loads(result.stdout) == {
+        "items": [
+            {"name": f"synthetic-{index:02d}", "role": "user", "trigger_count": index} for index in range(41)
         ]
     }
 
@@ -175,7 +196,7 @@ def test_projects_list_empty_project_list_makes_no_count_requests(
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {"items": []}
     assert RecordingClient.last is not None
-    assert RecordingClient.last.calls == [("list_projects",)]
+    assert RecordingClient.last.calls == [("list_projects_with_counts",)]
 
     human = runner.invoke(app, ["projects", "list"])
     assert human.exit_code == 0, human.output

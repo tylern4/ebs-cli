@@ -61,14 +61,16 @@ def test_project_page_parses_name_and_role_and_ignores_extras() -> None:
     page = ProjectPage.model_validate(
         {
             "items": [
-                {"name": "dasrepo", "role": "user", "internal_field": "ignored"},
+                {"name": "dasrepo", "role": "user", "trigger_count": 7, "internal_field": "ignored"},
                 {"name": "nstaff", "role": "maintainer"},
             ]
         }
     )
 
     assert page.items[0].name == "dasrepo"
+    assert page.items[0].trigger_count == 7
     assert page.items[1].role == "maintainer"
+    assert page.items[1].trigger_count is None
 
 
 def test_project_rejects_empty_or_control_character_fields() -> None:

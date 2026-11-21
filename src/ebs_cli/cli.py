@@ -223,12 +223,15 @@ def projects_list(ctx: typer.Context, json_output: JSONOption = False) -> None:
     """List the Projects your account can access, with per-Project trigger counts."""
     options = ctx.ensure_object(Options)
     with EBSClient(options.url, load_token(), None) as client:
-        projects = client.list_projects()
+        projects = client.list_projects(include_trigger_counts=True)
         ordered = sorted(projects, key=lambda item: item.name)
         counted: list[tuple[Project, int]] = []
         for project in ordered:
             try:
-                counted.append((project, client.count_triggers(project.name)))
+                count = project.trigger_count
+                if count is None:  # Compatibility with an API that predates batched counts.
+                    count = client.count_triggers(project.name)
+                counted.append((project, count))
             except CLIError as exc:
                 raise CLIError(
                     f"Could not count triggers in Project '{project.name}'. {exc}",

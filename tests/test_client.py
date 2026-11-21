@@ -236,6 +236,34 @@ def test_projects_request_uses_bearer_without_group_header_and_parses_items() ->
     ]
 
 
+def test_projects_request_can_opt_in_to_batched_trigger_counts() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path == "/api/v1/projects"
+        assert dict(request.url.params) == {"include_trigger_counts": "true"}
+        assert "X-Group" not in request.headers
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {"name": "dasrepo", "role": "user", "trigger_count": 0},
+                    {"name": "nstaff", "role": "maintainer", "trigger_count": 12},
+                ]
+            },
+        )
+
+    client = EBSClient(
+        "https://ebs.example.test", "ebs_transport-test-token", None, transport=httpx.MockTransport(handler)
+    )
+    with client:
+        projects = client.list_projects(include_trigger_counts=True)
+
+    assert len(requests) == 1
+    assert [project.trigger_count for project in projects] == [0, 12]
+
+
 def test_count_triggers_sends_one_bounded_page_scoped_to_the_named_project() -> None:
     requests: list[httpx.Request] = []
 

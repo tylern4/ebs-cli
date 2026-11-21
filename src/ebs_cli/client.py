@@ -175,13 +175,18 @@ class EBSClient:
             message = f"Request failed with HTTP {response.status_code}. {detail}"
         raise CLIError(redact_secrets(safe_text(message, limit=700)))
 
-    def list_projects(self) -> list[Project]:
-        """Return the caller's Project memberships in endpoint order.
+    def list_projects(self, *, include_trigger_counts: bool = False) -> list[Project]:
+        """Return memberships, optionally with one-shot exact trigger totals.
 
         This request is authenticated but never scoped to a selected Project,
-        so no ``X-Group`` header is sent.
+        so no ``X-Group`` header is sent. An older API omits ``trigger_count``
+        from each item; callers can retain their bounded per-Project fallback.
         """
-        page = _parse(ProjectPage, self._request("GET", "/projects", project_scoped=False))
+        params = {"include_trigger_counts": "true"} if include_trigger_counts else None
+        page = _parse(
+            ProjectPage,
+            self._request("GET", "/projects", params=params, project_scoped=False),
+        )
         return list(page.items)
 
     def list_triggers(
