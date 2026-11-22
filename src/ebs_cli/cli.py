@@ -23,7 +23,11 @@ from ebs_cli.client import (
 from ebs_cli.config import (
     DEFAULT_URL,
     config_path,
+    load_globus_snapshot,
     load_token,
+    optional_globus_credentials,
+    read_auth_snapshot,
+    save_auth_credentials,
     save_project,
     save_token,
     saved_project,
@@ -32,6 +36,9 @@ from ebs_cli.config import (
 from ebs_cli.config import logout as remove_token
 from ebs_cli.errors import CLIError
 from ebs_cli.models import Event, Project, S3Credentials, Trigger
+from ebs_cli.native_auth import browser_login as native_browser_login
+from ebs_cli.native_auth import refresh_login as native_refresh_login
+from ebs_cli.native_auth import revoke_refresh_token
 from ebs_cli.output import console, print_error, print_json, print_panel, safe_text, text
 from ebs_cli.s3ops import delete_object, download_object, list_objects
 from ebs_cli.security import redacted_headers
@@ -184,13 +191,9 @@ def api_client(ctx: typer.Context) -> EBSClient:
     return EBSClient(options.url, load_token(), project)
 
 
-@auth_app.command("login")
-@guarded
-def login() -> None:
-    """Save a personal API token in an owner-only config file."""
-    token = typer.prompt("Personal EBS API token", hide_input=True)
-    path = save_token(token)
-    message = f"Saved API token to {path} with owner-only permissions."
+def _login_saved_message(path: Path, *, globus: bool) -> None:
+    credential = "API token and Globus refresh credential" if globus else "API token"
+    message = f"Saved {credential} to {path} with owner-only permissions."
     try:
         keeps_project = saved_project(path) is not None
     except CLIError:
@@ -200,21 +203,113 @@ def login() -> None:
     console.print(message, markup=False)
 
 
+@auth_app.command(
+    "login",
+    # Capture unexpected arguments so Click cannot echo a mistakenly supplied
+    # credential in its rich usage error; reject the whole invocation instead.
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+@guarded
+def login(
+    ctx: typer.Context,
+    token: Annotated[
+        bool,
+        typer.Option("--token", help="Prompt for a personal token without opening a browser."),
+    ] = False,
+    no_browser: Annotated[
+        bool,
+        typer.Option("--no-browser", help="Print the authorization URL instead of opening it."),
+    ] = False,
+) -> None:
+    """Log in through Globus, or use --token for a hidden manual prompt."""
+    if ctx.args:
+        raise CLIError(
+            "Unexpected login arguments were rejected. Never pass a credential on the command line; "
+            "use 'ebs auth login --token' for a hidden interactive prompt.",
+            exit_code=2,
+        )
+    if token:
+        if no_browser:
+            raise CLIError("--no-browser cannot be combined with --token.", exit_code=2)
+        manual_token = typer.prompt("Personal EBS API token", hide_input=True)
+        path = save_token(manual_token)
+        _login_saved_message(path, globus=False)
+        return
+    options = ctx.ensure_object(Options)
+    credentials = native_browser_login(
+        options.url,
+        no_browser=no_browser,
+        show_url=lambda url: typer.echo(f"Open this URL to authorize the EBS CLI:\n{url}"),
+    )
+    path = save_auth_credentials(
+        credentials.token,
+        credentials.refresh_token,
+        credentials.client_id,
+    )
+    _login_saved_message(path, globus=True)
+
+
+@auth_app.command("refresh")
+@guarded
+def refresh(ctx: typer.Context) -> None:
+    """Rotate the saved personal token using the saved Globus grant."""
+    expected, refresh_token, client_id = load_globus_snapshot()
+    options = ctx.ensure_object(Options)
+    credentials = native_refresh_login(
+        options.url,
+        refresh_token,
+        client_id,
+    )
+    path = save_auth_credentials(
+        credentials.token,
+        credentials.refresh_token,
+        credentials.client_id,
+        expected=expected,
+    )
+    _login_saved_message(path, globus=True)
+
+
 @auth_app.command("logout")
 @guarded
-def logout() -> None:
-    """Remove the saved API token, keeping any saved default Project."""
-    if remove_token():
+def logout(
+    local_only: Annotated[
+        bool,
+        typer.Option("--local-only", help="Clear local credentials without contacting Globus."),
+    ] = False,
+) -> None:
+    """Clear saved login credentials, optionally revoking only the CLI grant."""
+    expected = read_auth_snapshot()
+    globus_credentials = optional_globus_credentials(snapshot=expected)
+    revocation_confirmed = False
+    revocation_attempted = globus_credentials is not None and not local_only
+    if globus_credentials is not None and not local_only:
+        try:
+            revoke_refresh_token(*globus_credentials)
+            revocation_confirmed = True
+        except CLIError:
+            # Local clearing must still work offline; never claim server logout.
+            pass
+    if remove_token(expected=expected):
         try:
             keeps_project = saved_project() is not None
         except CLIError:
             keeps_project = False
-        message = "Removed the saved API token."
+        message = "Removed the saved EBS and Globus login credentials from this device."
         if keeps_project:
             message += " The saved default Project remains."
-        console.print(message)
+        console.print(message, markup=False)
+        if revocation_confirmed:
+            console.print("Globus confirmed revocation of the saved CLI grant.", markup=False)
+        elif revocation_attempted:
+            console.print(
+                "Globus revocation was not confirmed; the provider grant may remain active. "
+                "Revoke it from your Globus account if needed.",
+                markup=False,
+            )
+        elif local_only and globus_credentials is not None:
+            console.print("Local-only logout did not revoke the Globus grant.", markup=False)
     else:
-        console.print("No saved API token was present.")
+        console.print("No saved login credentials were present.")
 
 
 @projects_app.command("list")

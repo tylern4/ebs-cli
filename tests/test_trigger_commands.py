@@ -80,10 +80,16 @@ def test_version_and_bare_help_succeed(runner: CliRunner) -> None:
     assert "Usage:" in bare.stdout
 
 
-def test_token_is_not_accepted_as_a_command_line_option(runner: CliRunner) -> None:
+def test_token_option_is_only_a_hidden_prompt_switch(runner: CliRunner) -> None:
     login_help = runner.invoke(app, ["auth", "login", "--help"])
     root_help = runner.invoke(app, ["--help"])
 
     assert login_help.exit_code == root_help.exit_code == 0
-    assert "--token" not in login_help.stdout
+    assert "--token" in login_help.stdout
+    assert "hidden" in login_help.stdout
+    assert "--no-browser" in login_help.stdout
     assert "--token" not in root_help.stdout
+
+    result = runner.invoke(app, ["auth", "login", "--token=ebs_not-an-allowed-value"])
+    assert result.exit_code != 0
+    assert "ebs_not-an-allowed-value" not in result.output

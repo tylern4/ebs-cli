@@ -19,13 +19,23 @@ uv sync
 source .venv/bin/activate
 ```
 
-Log in with a personal EBS API token from the web interface:
+Log in through Globus in your browser:
 
 ```sh
 ebs auth login
 ```
 
-The prompt hides the token, and it is saved to an owner-only config file. There is deliberately no `--token` option, so tokens do not end up in shell history or command-line completion.
+The CLI uses a Native App authorization-code + PKCE flow, then saves the
+personal EBS token, Globus refresh credential, and public client ID together in
+an owner-only config file. No web-client secret or short-lived access token is
+saved. Use `ebs auth refresh` for an explicit later token rotation, and
+`ebs auth logout` to clear both saved login credentials (plus revocation of the
+CLI grant when Globus confirms it).
+
+For manual token bootstrap or automation, `ebs auth login --token` selects a
+hidden prompt for a personal token from the web interface. `--token` is only a
+switch and never accepts a value, keeping credentials out of command arguments
+and shell history. `EBS_TOKEN` remains available for ephemeral environments.
 
 List your Projects and save a default:
 
@@ -69,7 +79,7 @@ ebs s3 upload TRIGGER ./data.fits
 | Guide | Contents |
 | --- | --- |
 | [Web interface](docs/web-interface.md) | Signing in, Projects, tokens, triggers, events, and upload access in the browser |
-| [Authentication and Projects](docs/authentication.md) | Tokens, the config file, environment variables, Project selection and precedence |
+| [Authentication and Projects](docs/authentication.md) | Globus browser login, manual tokens, refresh/logout, config security, and Project precedence |
 | [Triggers and events](docs/triggers.md) | Listing, filtering, pagination, trigger references |
 | [S3 operations and boto3](docs/s3.md) | Scoped temporary credentials, object commands, uploads, presigned URLs |
 | [Development and CI](docs/development.md) | Tests, linting, builds, and continuous integration |
