@@ -74,6 +74,9 @@ jobs:
           triggers show
           triggers enable
           triggers disable
+          triggers create
+          triggers apply
+          triggers export
           events list
           s3 credentials
           s3 upload-url

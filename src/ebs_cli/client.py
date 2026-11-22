@@ -15,6 +15,7 @@ from ebs_cli.models import (
     Project,
     ProjectPage,
     S3Credentials,
+    SfapiTokenMetadata,
     Trigger,
     UploadURL,
 )
@@ -240,6 +241,22 @@ class EBSClient:
 
     def get_trigger(self, trigger_id: UUID) -> Trigger:
         return _parse(Trigger, self._request("GET", f"/triggers/{trigger_id}"))
+
+    def create_trigger(self, payload: dict[str, Any]) -> Trigger:
+        """Create one trigger; details are suppressed because errors may quote authored content."""
+        return _parse(Trigger, self._request("POST", "/triggers", json=payload, sensitive=True))
+
+    def update_trigger(self, trigger_id: UUID, payload: dict[str, Any]) -> Trigger:
+        """Replace all mutable fields supplied by a declarative apply."""
+        return _parse(
+            Trigger,
+            self._request("PATCH", f"/triggers/{trigger_id}", json=payload, sensitive=True),
+        )
+
+    def list_sfapi_tokens(self) -> list[SfapiTokenMetadata]:
+        """List accessible scheduler credentials without readable credential material."""
+        response = self._request("GET", "/me/sfapi-tokens", project_scoped=False)
+        return _parse(list[SfapiTokenMetadata], response)
 
     def set_trigger_enabled(self, trigger_id: UUID, enabled: bool) -> Trigger:
         return _parse(Trigger, self._request("PATCH", f"/triggers/{trigger_id}", json={"enabled": enabled}))

@@ -26,6 +26,8 @@ class Trigger(APIModel):
     pipeline: dict[str, Any]
     enabled: bool
     machine: str | None = None
+    sfapi_token_ref: UUID | None = None
+    sfapi_account: str | None = None
     instance: TriggerInstance | None = None
     created_at: datetime
     updated_at: datetime
@@ -120,6 +122,22 @@ class Project(BaseModel):
 
 class ProjectPage(BaseModel):
     items: list[Project]
+
+
+class SfapiTokenMetadata(BaseModel):
+    """Non-secret metadata for one accessible scheduler credential."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    token_ref: UUID
+    sfapi_username: str = Field(min_length=1)
+    uploader: str | None
+    created_at: datetime
+    updated_at: datetime
+    issued_at: datetime | None
+    expires_at: datetime
+    accounts: list[str]
+    can_manage: bool
 
 
 class UploadURL(BaseModel):

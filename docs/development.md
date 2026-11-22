@@ -19,6 +19,9 @@ uv run ebs triggers list --help
 uv run ebs triggers show --help
 uv run ebs triggers enable --help
 uv run ebs triggers disable --help
+uv run ebs triggers create --help
+uv run ebs triggers apply --help
+uv run ebs triggers export --help
 uv run ebs events list --help
 uv run ebs s3 credentials --help
 uv run ebs s3 upload-url --help

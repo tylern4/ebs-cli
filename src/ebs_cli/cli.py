@@ -6,6 +6,7 @@ from enum import StrEnum
 from functools import wraps
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
+from uuid import UUID
 
 import typer
 from rich.table import Table
@@ -45,6 +46,17 @@ from ebs_cli.native_auth import revoke_refresh_token
 from ebs_cli.output import console, print_error, print_json, print_panel, safe_text, text
 from ebs_cli.s3ops import delete_object, download_object, list_objects
 from ebs_cli.security import redacted_headers
+from ebs_cli.trigger_documents import (
+    TriggerDocument,
+    create_payload,
+    current_state,
+    desired_state,
+    dump_editable_yaml,
+    exact_name_candidates,
+    export_document,
+    read_trigger_document,
+    resolve_document_binding,
+)
 from ebs_cli.uploads import upload_file
 
 app = typer.Typer(
@@ -80,6 +92,11 @@ TriggerRefArgument = Annotated[
         help="Trigger ID or exact trigger name in the selected Project.",
     ),
 ]
+
+
+class DocumentFormat(StrEnum):
+    JSON = "json"
+    YAML = "yaml"
 
 
 class S3Operation(StrEnum):
@@ -214,8 +231,7 @@ def _normal_api_client(options: Options, project: str | None) -> EBSClient:
     return EBSClient(options.url, saved.token, project, renew_token=renew_token)
 
 
-def api_client(ctx: typer.Context) -> EBSClient:
-    options = ctx.ensure_object(Options)
+def _required_project(options: Options) -> str:
     project, _source = resolve_project(options)
     if project is None:
         raise CLIError(
@@ -223,7 +239,12 @@ def api_client(ctx: typer.Context) -> EBSClient:
             "'ebs projects use PROJECT' to save a default, or pass --project or set EBS_PROJECT.",
             exit_code=2,
         )
-    return _normal_api_client(options, project)
+    return project
+
+
+def api_client(ctx: typer.Context) -> EBSClient:
+    options = ctx.ensure_object(Options)
+    return _normal_api_client(options, _required_project(options))
 
 
 def _login_saved_message(path: Path, *, globus: bool) -> None:
@@ -483,6 +504,134 @@ def triggers_list(
     if last < page.total:
         summary += f" Use --offset {last} for the next page."
     console.print(summary)
+
+
+def _document_client(ctx: typer.Context, document: TriggerDocument) -> EBSClient:
+    """Honor explicit/environment/saved Project selection without overriding authored identity."""
+    validate_trigger_name(document.name)
+    document.project = validate_project_name(document.project)
+    options = ctx.ensure_object(Options)
+    selected, _source = resolve_project(options)
+    if selected is not None and selected != document.project:
+        raise CLIError(
+            "The document Project does not match the effective --project, environment, "
+            "or saved Project selection.",
+            exit_code=2,
+        )
+    return _normal_api_client(options, document.project)
+
+
+def _require_available_project(client: EBSClient, project: str) -> None:
+    matches = [candidate for candidate in client.list_projects() if candidate.name == project]
+    if len(matches) != 1:
+        reason = "ambiguous" if matches else "unknown or inaccessible"
+        raise CLIError(
+            f"Project '{project}' is {reason}. Run 'ebs projects list' to see available Projects.",
+            exit_code=2,
+        )
+
+
+def _document_binding(client: EBSClient, document: TriggerDocument) -> tuple[UUID | None, str | None]:
+    credentials = client.list_sfapi_tokens() if document.sfapi_username is not None else []
+    return resolve_document_binding(document, credentials)
+
+
+def _write_result(action: str, trigger: Trigger, name: str, project: str, json_output: bool) -> None:
+    # The response name is untrusted display text; the already validated
+    # authoring identity supplies bounded one-line human and stable JSON output.
+    if json_output:
+        print_json({"action": action, "id": str(trigger.id), "name": name, "project": project})
+        return
+    if action == "unchanged":
+        console.print(
+            f"Trigger '{name}' in Project '{project}' is already up to date (ID {trigger.id}).",
+            markup=False,
+        )
+    else:
+        console.print(f"{action}: trigger '{name}' in Project '{project}' (ID {trigger.id}).", markup=False)
+
+
+@triggers_app.command("create")
+@guarded
+def triggers_create(
+    ctx: typer.Context,
+    file: Annotated[str, typer.Option("--file", help="JSON/YAML file, or '-' for standard input.")],
+    format: Annotated[
+        DocumentFormat | None,
+        typer.Option("--format", help="Input syntax; required when --file is '-'."),
+    ] = None,
+    json_output: JSONOption = False,
+) -> None:
+    """Create one trigger from a complete JSON or YAML document."""
+    document = read_trigger_document(file, format.value if format is not None else None)
+    with _document_client(ctx, document) as client:
+        _require_available_project(client, document.project)
+        token_ref, account = _document_binding(client, document)
+        trigger = client.create_trigger(create_payload(document, token_ref, account))
+    _write_result("created", trigger, document.name, document.project, json_output)
+
+
+@triggers_app.command("apply")
+@guarded
+def triggers_apply(
+    ctx: typer.Context,
+    file: Annotated[str, typer.Option("--file", help="JSON/YAML file, or '-' for standard input.")],
+    format: Annotated[
+        DocumentFormat | None,
+        typer.Option("--format", help="Input syntax; required when --file is '-'."),
+    ] = None,
+    json_output: JSONOption = False,
+) -> None:
+    """Create, fully update, or no-op one exact Project/name identity."""
+    document = read_trigger_document(file, format.value if format is not None else None)
+    with _document_client(ctx, document) as client:
+        _require_available_project(client, document.project)
+        matches = exact_name_candidates(client, document.name)
+        if len(matches) > 1:
+            raise CLIError(
+                "The trigger name is ambiguous in the document Project. Apply requires exactly one match.",
+                exit_code=2,
+            )
+        token_ref, account = _document_binding(client, document)
+        desired = desired_state(document, token_ref, account)
+        if matches and current_state(matches[0]) == desired:
+            trigger = matches[0]
+            action = "unchanged"
+        elif matches:
+            trigger = client.update_trigger(matches[0].id, desired)
+            action = "updated"
+        else:
+            trigger = client.create_trigger(create_payload(document, token_ref, account))
+            action = "created"
+    _write_result(action, trigger, document.name, document.project, json_output)
+
+
+@triggers_app.command("export")
+@guarded
+def triggers_export(ctx: typer.Context, trigger_ref: TriggerRefArgument) -> None:
+    """Write one editable YAML document to standard output."""
+    options = ctx.ensure_object(Options)
+    selected = _required_project(options)
+    try:
+        direct_id = UUID(trigger_ref)
+    except ValueError:
+        direct_id = None
+    with _normal_api_client(options, selected) as client:
+        trigger_id = direct_id if direct_id is not None else resolve_trigger_reference(client, trigger_ref)
+        trigger = client.get_trigger(trigger_id)
+        if trigger.group_name is not None and trigger.group_name != selected:
+            raise CLIError("The trigger is not in the selected Project.", exit_code=2)
+        if direct_id is not None:
+            candidates = exact_name_candidates(client, trigger.name)
+            identity = [candidate for candidate in candidates if candidate.id == direct_id]
+            if len(identity) != 1:
+                raise CLIError("The trigger ID is not uniquely present in the selected Project.", exit_code=2)
+            listed_project = identity[0].group_name
+            if listed_project is not None and listed_project != selected:
+                raise CLIError("The trigger is not in the selected Project.", exit_code=2)
+        credentials = client.list_sfapi_tokens() if trigger.sfapi_token_ref is not None else []
+        document = export_document(trigger, selected, credentials)
+    typer.echo(dump_editable_yaml(document), nl=False)
 
 
 def _event_json(event: Event) -> dict[str, Any]:

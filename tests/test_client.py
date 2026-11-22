@@ -29,6 +29,77 @@ def test_trigger_request_uses_bearer_project_and_offset_parameters() -> None:
     assert page.total == 15
 
 
+def test_trigger_document_write_and_credential_metadata_requests() -> None:
+    requests: list[httpx.Request] = []
+    create = {
+        "name": "data-ready",
+        "group": "physics",
+        "version": "v3",
+        "enabled": True,
+        "machine": "perlmutter",
+        "sfapi_token_ref": "00000000-0000-7000-8000-00000000c001",
+        "sfapi_account": "shared",
+        "pipeline": trigger_data()["pipeline"],
+    }
+    update = {key: value for key, value in create.items() if key != "group"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/v1/me/sfapi-tokens":
+            assert request.method == "GET"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "token_ref": "00000000-0000-7000-8000-00000000c001",
+                        "sfapi_username": "alice",
+                        "uploader": "owner",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "issued_at": None,
+                        "expires_at": "2037-01-01T00:00:00Z",
+                        "accounts": ["alice", "c_shared"],
+                        "can_manage": True,
+                    }
+                ],
+            )
+        if request.method == "POST":
+            assert request.url.path == "/api/v1/triggers"
+            return httpx.Response(201, json=trigger_data(sfapi_token_ref=create["sfapi_token_ref"]))
+        assert request.method == "PATCH"
+        assert request.url.path == f"/api/v1/triggers/{TRIGGER_ID}"
+        return httpx.Response(200, json=trigger_data(sfapi_token_ref=create["sfapi_token_ref"]))
+
+    with make_client(handler) as client:
+        credentials = client.list_sfapi_tokens()
+        created = client.create_trigger(create)
+        updated = client.update_trigger(TRIGGER_ID, update)
+
+    assert credentials[0].sfapi_username == "alice"
+    assert credentials[0].accounts == ["alice", "c_shared"]
+    assert created.id == updated.id == TRIGGER_ID
+    assert json.loads(requests[1].content) == create
+    assert json.loads(requests[2].content) == update
+
+
+def test_trigger_write_error_never_echoes_complete_authored_document() -> None:
+    marker = "complete-private-template-and-request-body"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={"detail": f"validation failed for {marker} with ebs_echoed-token"},
+        )
+
+    with make_client(handler) as client:
+        with pytest.raises(CLIError) as caught:
+            client.create_trigger({"name": marker})
+
+    assert marker not in str(caught.value)
+    assert "ebs_echoed-token" not in str(caught.value)
+    assert "secrets-bearing" in str(caught.value)
+
+
 def test_event_request_uses_cursor_filters_and_typed_envelope() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == f"/api/v1/triggers/{TRIGGER_ID}/events"
