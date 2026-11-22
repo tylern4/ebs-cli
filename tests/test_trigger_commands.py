@@ -1,6 +1,7 @@
 import json
 
 from conftest import TRIGGER_ID, FakeAPI
+from rich.text import Text
 from typer.testing import CliRunner
 
 from ebs_cli.cli import app
@@ -81,14 +82,16 @@ def test_version_and_bare_help_succeed(runner: CliRunner) -> None:
 
 
 def test_token_option_is_only_a_hidden_prompt_switch(runner: CliRunner) -> None:
-    login_help = runner.invoke(app, ["auth", "login", "--help"])
-    root_help = runner.invoke(app, ["--help"])
+    login_help = runner.invoke(app, ["auth", "login", "--help"], env={"COLUMNS": "200"})
+    root_help = runner.invoke(app, ["--help"], env={"COLUMNS": "200"})
 
     assert login_help.exit_code == root_help.exit_code == 0
-    assert "--token" in login_help.stdout
-    assert "hidden" in login_help.stdout
-    assert "--no-browser" in login_help.stdout
-    assert "--token" not in root_help.stdout
+    plain_login_help = Text.from_ansi(login_help.stdout).plain
+    plain_root_help = Text.from_ansi(root_help.stdout).plain
+    assert "--token" in plain_login_help
+    assert "hidden" in plain_login_help
+    assert "--no-browser" in plain_login_help
+    assert "--token" not in plain_root_help
 
     result = runner.invoke(app, ["auth", "login", "--token=ebs_not-an-allowed-value"])
     assert result.exit_code != 0
