@@ -28,9 +28,14 @@ ebs auth login
 The CLI uses a Native App authorization-code + PKCE flow, then saves the
 personal EBS token, Globus refresh credential, and public client ID together in
 an owner-only config file. No web-client secret or short-lived access token is
-saved. Use `ebs auth refresh` for an explicit later token rotation, and
-`ebs auth logout` to clear both saved login credentials (plus revocation of the
-CLI grant when Globus confirms it).
+saved. Personal tokens expire after 48 hours. If an ordinary API request then
+receives HTTP 401, the saved Globus grant replaces the token and retries once;
+this never applies to `EBS_TOKEN`, manual token login, or direct S3 operations.
+Use `ebs auth refresh` for an explicit earlier rotation, and `ebs auth logout`
+to clear both saved login credentials (plus revocation of the CLI grant when
+Globus confirms it). Over SSH, run `ebs auth login --no-browser`,
+open the displayed URL on any device, and paste the Globus one-time code into
+the hidden prompt. This mode opens no local callback listener.
 
 For manual token bootstrap or automation, `ebs auth login --token` selects a
 hidden prompt for a personal token from the web interface. `--token` is only a

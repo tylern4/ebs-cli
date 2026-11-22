@@ -37,6 +37,16 @@ class AuthSnapshot:
     _invalid_digest: str | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True)
+class SavedApiAuth:
+    """One consistent saved token and optional matching Globus renewal grant."""
+
+    snapshot: AuthSnapshot = field(repr=False)
+    token: str = field(repr=False)
+    refresh_token: str | None = field(default=None, repr=False)
+    client_id: str | None = None
+
+
 def _snapshot_from_settings(settings: dict[str, Any]) -> AuthSnapshot:
     return AuthSnapshot(
         tuple(
@@ -106,13 +116,32 @@ def validate_token(token: str) -> str:
     return token
 
 
+def _config_error(
+    message: str,
+    path: Path,
+    *,
+    error_type: type[CLIError] = CLIError,
+    exit_code: int = 1,
+) -> CLIError:
+    """Keep private path context available internally, never in rendered text."""
+    error = error_type(message, exit_code=exit_code)
+    error.path = path
+    return error
+
+
 def _check_private_info(path: Path, info: os.stat_result) -> None:
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise CLIError(f"Config path is not a regular file: {path}")
+        raise _config_error("Config path is not a regular file. Choose a private regular config file.", path)
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
-        raise CLIError(f"Config file is not owned by the current user: {path}")
+        raise _config_error(
+            "Config file is not owned by the current user. Use a config file owned by this user.", path
+        )
     if info.st_mode & 0o077:
-        raise CLIError(f"Config file is accessible by other users. Run: chmod 600 {path}")
+        raise _config_error(
+            "Config file is accessible by other users. Change it to owner-only mode 0600 "
+            "(for example: chmod 600 CONFIG_FILE), then retry.",
+            path,
+        )
 
 
 def _check_private_file(path: Path) -> None:
@@ -121,7 +150,9 @@ def _check_private_file(path: Path) -> None:
     except FileNotFoundError:
         return
     except OSError as exc:
-        raise CLIError(f"Could not inspect config file: {path}") from exc
+        raise _config_error(
+            "Could not inspect config file. Check its parent directory permissions and retry.", path
+        ) from exc
     _check_private_info(path, info)
 
 
@@ -129,10 +160,13 @@ def _check_lock_identity(path: Path, info: os.stat_result) -> None:
     try:
         current = path.lstat()
     except OSError:
-        raise CLIError(f"Could not verify config lock file: {path}") from None
+        raise _config_error("Could not verify config lock file. Retry the command.", path) from None
     _check_private_info(path, current)
     if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
-        raise CLIError(f"Config lock file changed while opening it: {path}")
+        raise _config_error(
+            "Config lock file changed while opening it. Retry without replacing config files concurrently.",
+            path,
+        )
 
 
 @contextmanager
@@ -163,7 +197,9 @@ def _config_lock(path: Path) -> Iterator[None]:
         if descriptor is not None:
             with suppress(OSError):
                 os.close(descriptor)
-        raise CLIError(f"Could not lock config file: {path}") from None
+        raise _config_error(
+            "Could not lock config file. Check the config directory permissions and retry.", path
+        ) from None
     try:
         yield
     finally:
@@ -182,11 +218,22 @@ def read_config(path: Path | None = None) -> dict[str, Any]:
         with path.open(encoding="utf-8") as stream:
             body = json.load(stream)
     except FileNotFoundError as exc:
-        raise MissingConfigError(f"No config file found at: {path}", exit_code=2) from exc
+        raise _config_error(
+            "No config file found. Run 'ebs auth login' or set EBS_TOKEN.",
+            path,
+            error_type=MissingConfigError,
+            exit_code=2,
+        ) from exc
     except (OSError, json.JSONDecodeError) as exc:
-        raise CLIError(f"Could not read config file: {path}") from exc
+        raise _config_error(
+            "Could not read config file. Check its JSON syntax and permissions, then retry "
+            "or run 'ebs auth login'.",
+            path,
+        ) from exc
     if not isinstance(body, dict):
-        raise CLIError(f"Config file does not contain a JSON object: {path}")
+        raise _config_error(
+            "Config file does not contain a JSON object. Run 'ebs auth login' to create a new login.", path
+        )
     return body
 
 
@@ -197,7 +244,11 @@ def _write_config(body: dict[str, Any], path: Path) -> Path:
         _check_private_file(path)
         descriptor, temporary_name = tempfile.mkstemp(prefix=".config.", dir=path.parent)
     except OSError as exc:
-        raise CLIError(f"Could not save config file: {path}") from exc
+        raise _config_error(
+            "Could not save config file. Check parent directory permissions and available disk space, "
+            "then retry.",
+            path,
+        ) from exc
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
@@ -210,7 +261,11 @@ def _write_config(body: dict[str, Any], path: Path) -> Path:
     except OSError as exc:
         with suppress(OSError):
             temporary.unlink(missing_ok=True)
-        raise CLIError(f"Could not save config file: {path}") from exc
+        raise _config_error(
+            "Could not save config file. Check parent directory permissions and available disk space, "
+            "then retry.",
+            path,
+        ) from exc
     return path
 
 
@@ -223,12 +278,14 @@ def _existing_settings(path: Path) -> dict[str, Any]:
 
 
 def save_token(token: str, path: Path | None = None) -> Path:
-    """Save the token, preserving the saved default Project and other settings."""
+    """Save a standalone token, preserving settings but removing any Globus grant."""
     token = validate_token(token)
     path = path or config_path()
     with _config_lock(path):
         settings = _existing_settings(path)
         settings[TOKEN_KEY] = token
+        for name in GLOBUS_CREDENTIAL_KEYS:
+            settings.pop(name, None)
         return _write_config(settings, path)
 
 
@@ -340,11 +397,44 @@ def saved_project(path: Path | None = None) -> str | None:
     if project is None:
         return None
     if not isinstance(project, str) or not project.strip():
-        raise CLIError(f"Config file does not contain a valid default Project: {path}")
+        raise _config_error(
+            "Config file does not contain a valid default Project. "
+            "Run 'ebs projects use PROJECT' to replace it.",
+            path,
+        )
     try:
         return validate_project_name(project)
     except CLIError as exc:
-        raise CLIError(f"Config file does not contain a valid default Project: {path}") from exc
+        raise _config_error(
+            "Config file does not contain a valid default Project. "
+            "Run 'ebs projects use PROJECT' to replace it.",
+            path,
+        ) from exc
+
+
+def load_saved_api_auth(path: Path | None = None) -> SavedApiAuth:
+    """Load one saved-file auth snapshot without consulting EBS_TOKEN.
+
+    A missing, partial, or invalid Globus pair disables renewal rather than
+    making an otherwise usable saved personal token unavailable.
+    """
+    path = path or config_path()
+    snapshot = read_auth_snapshot(path)
+    values = _snapshot_values(snapshot)
+    token = values.get(TOKEN_KEY)
+    if not isinstance(token, str):
+        raise CLIError("No API token found. Run 'ebs auth login' or set EBS_TOKEN.", exit_code=2)
+    token = validate_token(token)
+    refresh_token = values.get(GLOBUS_REFRESH_TOKEN_KEY)
+    client_id = values.get(GLOBUS_CLIENT_ID_KEY)
+    if not isinstance(refresh_token, str) or not isinstance(client_id, str):
+        return SavedApiAuth(snapshot, token)
+    try:
+        refresh_token = _validate_globus_value(refresh_token, "Globus refresh credential")
+        client_id = _validate_globus_value(client_id, "Globus client ID")
+    except CLIError:
+        return SavedApiAuth(snapshot, token)
+    return SavedApiAuth(snapshot, token, refresh_token, client_id)
 
 
 def load_token(path: Path | None = None) -> str:
@@ -359,7 +449,9 @@ def load_token(path: Path | None = None) -> str:
         raise CLIError("No API token found. Run 'ebs auth login' or set EBS_TOKEN.", exit_code=2) from None
     token = body.get(TOKEN_KEY)
     if not isinstance(token, str):
-        raise CLIError(f"Config file does not contain a valid API token: {path}")
+        raise _config_error(
+            "Config file does not contain a valid API token. Run 'ebs auth login' or set EBS_TOKEN.", path
+        )
     return validate_token(token)
 
 
@@ -374,7 +466,9 @@ def logout(path: Path | None = None, *, expected: AuthSnapshot | None = None) ->
         except FileNotFoundError:
             return False
         except OSError as exc:
-            raise CLIError(f"Could not inspect config file: {path}") from exc
+            raise _config_error(
+                "Could not inspect config file. Check its parent directory permissions and retry.", path
+            ) from exc
         try:
             body: dict[str, Any] | None = read_config(path)
         except CLIError:
@@ -389,5 +483,9 @@ def logout(path: Path | None = None, *, expected: AuthSnapshot | None = None) ->
         try:
             path.unlink()
         except OSError as exc:
-            raise CLIError(f"Could not remove config file: {path}") from exc
+            raise _config_error(
+                "Could not remove config file after logout. Check its permissions and retry "
+                "'ebs auth logout'.",
+                path,
+            ) from exc
         return True

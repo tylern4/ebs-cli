@@ -107,6 +107,36 @@ def test_authorization_url_has_exact_redirect_scope_and_pkce() -> None:
     assert native.REDIRECT_URI == "http://127.0.0.1:53682/oauth/callback"
 
 
+def test_manual_authorization_url_uses_code_display_redirect_with_state_and_pkce() -> None:
+    config = NativeClientConfig(CLIENT_ID, AUTHORIZATION_ENDPOINT, TOKEN_ENDPOINT)
+
+    url = native.authorization_url(
+        config,
+        state=STATE,
+        challenge=CHALLENGE,
+        redirect_uri=native.CODE_DISPLAY_REDIRECT_URI,
+    )
+    query = parse_qs(urlsplit(url).query)
+
+    assert native.CODE_DISPLAY_REDIRECT_URI == "https://auth.globus.org/v2/web/auth-code"
+    assert query["redirect_uri"] == [native.CODE_DISPLAY_REDIRECT_URI]
+    assert query["state"] == [STATE]
+    assert query["code_challenge"] == [CHALLENGE]
+    assert query["code_challenge_method"] == ["S256"]
+    assert query["scope"] == ["openid profile email offline_access"]
+    assert VERIFIER not in url
+
+
+def test_authorization_url_refuses_any_unregistered_redirect() -> None:
+    with pytest.raises(CLIError, match="unsupported.*redirect"):
+        native.authorization_url(
+            NativeClientConfig(CLIENT_ID, AUTHORIZATION_ENDPOINT, TOKEN_ENDPOINT),
+            state=STATE,
+            challenge=CHALLENGE,
+            redirect_uri="https://example.test/callback",
+        )
+
+
 def test_callback_state_comparison_is_constant_time(monkeypatch: pytest.MonkeyPatch) -> None:
     observed = []
     original = native.hmac.compare_digest
@@ -293,6 +323,7 @@ def _login_transport(
     *,
     refreshed: bool = False,
     include_rotated_refresh: bool = True,
+    manual: bool = False,
 ) -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -311,7 +342,7 @@ def _login_transport(
                     "grant_type": ["authorization_code"],
                     "code": ["one-time-code"],
                     "client_id": [CLIENT_ID],
-                    "redirect_uri": [native.REDIRECT_URI],
+                    "redirect_uri": [native.CODE_DISPLAY_REDIRECT_URI if manual else native.REDIRECT_URI],
                     "code_verifier": [VERIFIER],
                 }
             body: dict[str, Any] = {
@@ -341,6 +372,11 @@ def test_browser_login_invokes_browser_exchanges_directly_and_returns_no_access_
     callback = FakeCallback(STATE)
     opened: list[str] = []
     monkeypatch.setattr(native, "generate_oauth_material", lambda: (STATE, VERIFIER, CHALLENGE))
+    monkeypatch.setattr(
+        native.getpass,
+        "getpass",
+        lambda _message: pytest.fail("local login must not use the manual code prompt"),
+    )
 
     result = native.browser_login(
         "https://ebs.test",
@@ -365,25 +401,135 @@ def test_browser_login_invokes_browser_exchanges_directly_and_returns_no_access_
     assert "new-refresh-credential" not in repr(result)
 
 
-def test_no_browser_prints_authorization_url_without_opening(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_browser_uses_hidden_manual_prompt_without_listener_or_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     requests: list[httpx.Request] = []
-    callback = FakeCallback(STATE)
     printed: list[str] = []
+    prompted: list[str] = []
     monkeypatch.setattr(native, "generate_oauth_material", lambda: (STATE, VERIFIER, CHALLENGE))
 
-    native.browser_login(
+    def hidden_prompt(message: str) -> str:
+        prompted.append(message)
+        return "  one-time-code\n"
+
+    monkeypatch.setattr(native.getpass, "getpass", hidden_prompt)
+    result = native.browser_login(
         "https://ebs.test",
         no_browser=True,
         show_url=printed.append,
-        transport=_login_transport(requests),
-        callback_factory=lambda state: callback,
+        transport=_login_transport(requests, manual=True),
+        callback_factory=lambda _state: pytest.fail("manual login must not open a callback listener"),
         open_browser=lambda _url: pytest.fail("browser should not open"),
+        wait_seconds=1,
     )
 
+    assert result == LoginCredentials("ebs_new-personal-token", "new-refresh-credential", CLIENT_ID)
     assert len(printed) == 1
-    assert CHALLENGE in printed[0]
+    query = parse_qs(urlsplit(printed[0]).query)
+    assert query["state"] == [STATE]
+    assert query["code_challenge"] == [CHALLENGE]
+    assert query["redirect_uri"] == [native.CODE_DISPLAY_REDIRECT_URI]
     assert VERIFIER not in printed[0]
-    assert callback.closed
+    assert "one-time-code" not in printed[0]
+    assert "short-lived-access-token" not in printed[0]
+    assert "new-refresh-credential" not in printed[0]
+    assert len(prompted) == 1
+    assert "input is hidden" in prompted[0]
+    assert [request.url.path for request in requests] == [
+        "/api/v1/auth/cli-config",
+        "/v2/oauth2/token",
+        "/api/v1/auth/cli/token",
+    ]
+
+
+@pytest.mark.parametrize("exception_type", [EOFError, KeyboardInterrupt])
+def test_manual_login_cancellation_never_exchanges_or_opens_listener(
+    exception_type: type[BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    monkeypatch.setattr(native, "generate_oauth_material", lambda: (STATE, VERIFIER, CHALLENGE))
+
+    def cancel(_message: str) -> str:
+        raise exception_type
+
+    with pytest.raises(CLIError, match="cancelled") as caught:
+        native.browser_login(
+            "https://ebs.test",
+            no_browser=True,
+            prompt_code=cancel,
+            transport=_login_transport(requests, manual=True),
+            callback_factory=lambda _state: pytest.fail("manual login must not open a listener"),
+            open_browser=lambda _url: pytest.fail("browser should not open"),
+        )
+
+    assert [request.url.path for request in requests] == ["/api/v1/auth/cli-config"]
+    assert "Nothing was saved" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("supplied", "message"),
+    [
+        ("", "No authorization code"),
+        ("   \n", "No authorization code"),
+        ("private-code\nsecond-line", "malformed"),
+        ("private-code\x00", "malformed"),
+        ("private-codeé", "malformed"),
+        ("x" * 4097, "malformed"),
+    ],
+)
+def test_manual_login_rejects_empty_or_malformed_code_before_exchange(
+    supplied: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    monkeypatch.setattr(native, "generate_oauth_material", lambda: (STATE, VERIFIER, CHALLENGE))
+
+    with pytest.raises(CLIError, match=message) as caught:
+        native.browser_login(
+            "https://ebs.test",
+            no_browser=True,
+            prompt_code=lambda _message: supplied,
+            transport=_login_transport(requests, manual=True),
+            callback_factory=lambda _state: pytest.fail("manual login must not open a listener"),
+        )
+
+    assert [request.url.path for request in requests] == ["/api/v1/auth/cli-config"]
+    if supplied.strip():
+        assert supplied.strip() not in str(caught.value)
+    assert "Nothing was saved" in str(caught.value)
+
+
+def test_manual_bad_code_and_exchange_body_are_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: list[httpx.Request] = []
+    printed: list[str] = []
+    secret = "one-time-code-and-provider-response-must-not-leak"
+    monkeypatch.setattr(native, "generate_oauth_material", lambda: (STATE, VERIFIER, CHALLENGE))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("cli-config"):
+            return httpx.Response(200, json=DISCOVERY)
+        if request.url == TOKEN_ENDPOINT:
+            return httpx.Response(400, text=secret)
+        return httpx.Response(201, json={"token": "ebs_must-not-be-created"})
+
+    with pytest.raises(CLIError, match="rejected.*authorization") as caught:
+        native.browser_login(
+            "https://ebs.test",
+            no_browser=True,
+            show_url=printed.append,
+            prompt_code=lambda _message: secret,
+            transport=httpx.MockTransport(handler),
+            callback_factory=lambda _state: pytest.fail("manual login must not open a listener"),
+        )
+
+    assert [request.url.path for request in requests] == [
+        "/api/v1/auth/cli-config",
+        "/v2/oauth2/token",
+    ]
+    assert secret not in str(caught.value)
+    assert secret not in "".join(printed)
+    assert "Nothing was saved" in str(caught.value)
 
 
 def test_browser_failure_closes_callback_before_any_exchange(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -724,6 +870,38 @@ def test_cli_browser_login_saves_both_credentials_and_project(
     }
     assert "ebs_browser-token" not in result.output
     assert "browser-refresh" not in result.output
+    assert str(path) not in result.output
+
+
+def test_cli_manual_login_prints_instructions_without_secrets_or_config_path(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "config.json"
+    seen: dict[str, Any] = {}
+    manual_url = (
+        "https://auth.globus.test/v2/oauth2/authorize?"
+        "state=public-test-state&code_challenge=public-test-challenge&"
+        "redirect_uri=https%3A%2F%2Fauth.globus.org%2Fv2%2Fweb%2Fauth-code"
+    )
+
+    def manual_login(*_args: Any, **kwargs: Any) -> LoginCredentials:
+        seen.update(kwargs)
+        kwargs["show_url"](manual_url)
+        return LoginCredentials("ebs_manual-token", "manual-refresh", CLIENT_ID)
+
+    monkeypatch.setattr(cli_module, "native_browser_login", manual_login)
+
+    result = runner.invoke(app, ["auth", "login", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["no_browser"] is True
+    assert manual_url in result.stdout
+    assert "any device" in result.stdout
+    assert "copy the one-time code" in result.stdout
+    assert "ebs_manual-token" not in result.output
+    assert "manual-refresh" not in result.output
+    assert str(path) not in result.output
+    assert read_config(path)["token"] == "ebs_manual-token"
 
 
 def test_cli_refresh_replaces_personal_token_and_rotated_grant(
@@ -745,6 +923,7 @@ def test_cli_refresh_replaces_personal_token_and_rotated_grant(
     assert read_config(path)[GLOBUS_REFRESH_TOKEN_KEY] == "rotated-refresh"
     assert read_config(path)["project"] == "physics"
     assert "rotated-refresh" not in result.output
+    assert str(path) not in result.output
 
 
 def test_cli_refresh_failure_preserves_saved_credentials(

@@ -49,13 +49,91 @@ def test_environment_token_takes_precedence_only_for_default_config(
     assert load_token(path) == "ebs_saved-test-token"
 
 
+def _assert_private_cli_error(result, path: Path, expected: str, *other_paths: Path) -> None:
+    output = result.stdout + result.stderr
+    assert result.exit_code != 0
+    assert expected in output
+    assert str(path) not in output
+    assert str(Path.home()) not in output
+    for private_path in other_paths:
+        assert str(private_path) not in output
+
+
 def test_permissive_config_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     save_token("ebs_saved-test-token", path)
     path.chmod(0o644)
 
-    with pytest.raises(CLIError, match="chmod 600"):
+    with pytest.raises(CLIError, match="chmod 600") as caught:
         load_token(path)
+
+    assert caught.value.path == path
+    assert str(path) not in str(caught.value)
+
+
+def test_cli_read_error_never_prints_config_or_home_paths(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = config_module.config_path()
+    path.write_text("{malformed-json\n", encoding="utf-8")
+    path.chmod(0o600)
+    monkeypatch.delenv("EBS_PROJECT")
+
+    result = runner.invoke(app, ["projects", "show"])
+
+    _assert_private_cli_error(result, path, "Could not read config file")
+
+
+def test_cli_permissions_error_never_prints_config_or_home_paths(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = config_module.config_path()
+    save_token("ebs_saved-test-token", path)
+    path.chmod(0o644)
+    monkeypatch.delenv("EBS_PROJECT")
+
+    result = runner.invoke(app, ["projects", "show"])
+
+    _assert_private_cli_error(result, path, "chmod 600 CONFIG_FILE")
+
+
+def test_cli_lock_error_never_prints_config_lock_or_home_paths(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = config_module.config_path()
+    lock_path = path.with_name(f".{path.name}.lock")
+    monkeypatch.setattr(
+        config_module.os, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("denied"))
+    )
+
+    result = runner.invoke(app, ["auth", "login", "--token"], input="ebs_manual-test-token\n")
+
+    _assert_private_cli_error(result, path, "Could not lock config file", lock_path)
+
+
+def test_cli_save_error_never_prints_config_or_home_paths(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = config_module.config_path()
+    monkeypatch.setattr(config_module.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("full")))
+
+    result = runner.invoke(app, ["auth", "login", "--token"], input="ebs_manual-test-token\n")
+
+    _assert_private_cli_error(result, path, "Could not save config file")
+
+
+def test_cli_logout_error_never_prints_config_or_home_paths(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = config_module.config_path()
+    save_token("ebs_saved-test-token", path)
+    monkeypatch.setattr(
+        config_module.Path, "unlink", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("denied"))
+    )
+
+    result = runner.invoke(app, ["auth", "logout"])
+
+    _assert_private_cli_error(result, path, "Could not remove config file after logout")
 
 
 def test_symlink_config_is_rejected(tmp_path: Path) -> None:
@@ -79,6 +157,7 @@ def test_login_prompt_does_not_echo_token_and_sets_permissions(
 
     assert result.exit_code == 0, result.output
     assert token not in result.output
+    assert str(path) not in result.output
     assert "owner-only" in result.stdout
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert load_token(path) == token
@@ -140,6 +219,25 @@ def test_save_token_preserves_the_saved_project(tmp_path: Path) -> None:
 
     assert saved_project(path) == "physics"
     assert load_token(path) == "ebs_saved-test-token"
+
+
+def test_manual_token_replaces_globus_login_and_preserves_other_settings(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    save_auth_credentials("ebs_old-token", "old-refresh", "old-client", path)
+    save_project("physics", path)
+    body = read_config(path)
+    body["custom"] = {"keep": True}
+    path.write_text(json.dumps(body) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+    save_token("ebs_manual-token", path)
+
+    assert read_config(path) == {
+        "token": "ebs_manual-token",
+        "project": "physics",
+        "custom": {"keep": True},
+    }
+    assert optional_globus_credentials(path) is None
 
 
 def test_token_only_file_migrates_unchanged_and_gains_a_project(tmp_path: Path) -> None:
@@ -549,7 +647,7 @@ def test_expected_auth_snapshot_detects_personal_token_only_changes(tmp_path: Pa
     save_auth_credentials("ebs_old-token", "same-refresh", "same-client", path)
     save_project("physics", path)
     expected = read_auth_snapshot(path)
-    save_token("ebs_changed-token", path)
+    save_auth_credentials("ebs_changed-token", "same-refresh", "same-client", path)
 
     with pytest.raises(CLIError, match="Concurrent login state changed"):
         save_auth_credentials("ebs_refreshed-token", "new-refresh", "same-client", path, expected=expected)

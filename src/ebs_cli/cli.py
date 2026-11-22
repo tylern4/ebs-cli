@@ -1,3 +1,4 @@
+import os
 import shlex
 import sys
 from collections.abc import Callable
@@ -21,9 +22,11 @@ from ebs_cli.client import (
     validate_trigger_name,
 )
 from ebs_cli.config import (
+    CONCURRENT_LOGIN_ERROR,
     DEFAULT_URL,
     config_path,
     load_globus_snapshot,
+    load_saved_api_auth,
     load_token,
     optional_globus_credentials,
     read_auth_snapshot,
@@ -179,6 +182,38 @@ def root(
         raise typer.Exit()
 
 
+def _normal_api_client(options: Options, project: str | None) -> EBSClient:
+    """Use saved-login renewal only when no environment token overrides the file."""
+    if os.environ.get("EBS_TOKEN") is not None:
+        return EBSClient(options.url, load_token(), project)
+
+    path = config_path()
+    saved = load_saved_api_auth(path)
+    renew_token: Callable[[], str] | None = None
+    if saved.refresh_token is not None and saved.client_id is not None:
+        refresh_token = saved.refresh_token
+        client_id = saved.client_id
+
+        def renew_saved_token() -> str:
+            # Detect a replacement before spending the saved grant, then repeat
+            # the same expected-snapshot check in the atomic storage transaction.
+            if read_auth_snapshot(path) != saved.snapshot:
+                raise CLIError(CONCURRENT_LOGIN_ERROR)
+            credentials = native_refresh_login(options.url, refresh_token, client_id)
+            save_auth_credentials(
+                credentials.token,
+                credentials.refresh_token,
+                credentials.client_id,
+                path,
+                expected=saved.snapshot,
+            )
+            return credentials.token
+
+        renew_token = renew_saved_token
+
+    return EBSClient(options.url, saved.token, project, renew_token=renew_token)
+
+
 def api_client(ctx: typer.Context) -> EBSClient:
     options = ctx.ensure_object(Options)
     project, _source = resolve_project(options)
@@ -188,12 +223,12 @@ def api_client(ctx: typer.Context) -> EBSClient:
             "'ebs projects use PROJECT' to save a default, or pass --project or set EBS_PROJECT.",
             exit_code=2,
         )
-    return EBSClient(options.url, load_token(), project)
+    return _normal_api_client(options, project)
 
 
 def _login_saved_message(path: Path, *, globus: bool) -> None:
     credential = "API token and Globus refresh credential" if globus else "API token"
-    message = f"Saved {credential} to {path} with owner-only permissions."
+    message = f"Saved {credential} with owner-only permissions."
     try:
         keeps_project = saved_project(path) is not None
     except CLIError:
@@ -218,7 +253,7 @@ def login(
     ] = False,
     no_browser: Annotated[
         bool,
-        typer.Option("--no-browser", help="Print the authorization URL instead of opening it."),
+        typer.Option("--no-browser", help="Print the authorization URL and use a hidden manual code prompt."),
     ] = False,
 ) -> None:
     """Log in through Globus, or use --token for a hidden manual prompt."""
@@ -239,7 +274,10 @@ def login(
     credentials = native_browser_login(
         options.url,
         no_browser=no_browser,
-        show_url=lambda url: typer.echo(f"Open this URL to authorize the EBS CLI:\n{url}"),
+        show_url=lambda url: typer.echo(
+            f"Open this URL in a browser on any device to authorize the EBS CLI:\n{url}\n"
+            "After authorizing, copy the one-time code shown by Globus."
+        ),
     )
     path = save_auth_credentials(
         credentials.token,
@@ -317,7 +355,7 @@ def logout(
 def projects_list(ctx: typer.Context, json_output: JSONOption = False) -> None:
     """List the Projects your account can access, with per-Project trigger counts."""
     options = ctx.ensure_object(Options)
-    with EBSClient(options.url, load_token(), None) as client:
+    with _normal_api_client(options, None) as client:
         projects = client.list_projects(include_trigger_counts=True)
         ordered = sorted(projects, key=lambda item: item.name)
         counted: list[tuple[Project, int]] = []
@@ -367,15 +405,15 @@ def projects_use(
     """Validate a Project name and save it as your default."""
     name = validate_project_name(project)
     options = ctx.ensure_object(Options)
-    with EBSClient(options.url, load_token(), None) as client:
+    with _normal_api_client(options, None) as client:
         available = client.list_projects()
     if not any(candidate.name == name for candidate in available):
         raise CLIError(
             f"Unknown Project '{name}'. Run 'ebs projects list' to see your Projects.",
             exit_code=2,
         )
-    path = save_project(name)
-    console.print(f"Saved default Project '{name}' to {path}.", markup=False)
+    save_project(name)
+    console.print(f"Saved default Project '{name}'.", markup=False)
 
 
 @projects_app.command("show")
@@ -392,8 +430,6 @@ def projects_show(ctx: typer.Context, json_output: JSONOption = False) -> None:
     details.add_column()
     details.add_row(text("Effective Project"), text(project if project is not None else "(none)"))
     details.add_row(text("Source"), text(PROJECT_SOURCE_LABELS[source]))
-    if source == PROJECT_SOURCE_SAVED:
-        details.add_row(text("Config"), text(config_path()))
     print_panel(details, title="Project selection")
     if project is None:
         console.print(

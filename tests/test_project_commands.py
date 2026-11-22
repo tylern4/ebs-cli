@@ -245,6 +245,7 @@ def test_projects_use_validates_against_endpoint_and_saves_default(
 
     assert result.exit_code == 0, result.output
     assert "Saved default Project 'alpha'" in result.stdout
+    assert str(config_file()) not in result.output
     assert RecordingClient.last is not None
     assert RecordingClient.last.project is None
     assert read_config_file() == {"project": "alpha"}
@@ -341,6 +342,8 @@ def test_projects_show_reports_the_saved_default(
     assert result.exit_code == 0, result.output
     assert "physics" in result.stdout
     assert "saved default Project" in result.stdout
+    assert str(config_file()) not in result.output
+    assert "Config" not in result.stdout
 
 
 def test_projects_show_reports_no_default(
@@ -378,9 +381,12 @@ def test_projects_show_reports_invalid_saved_project_value(
 
     result = runner.invoke(app, ["projects", "show"])
 
+    output = result.stdout + result.stderr
     assert result.exit_code == 1
-    assert "valid default Project" in result.stderr
-    assert "bad\nname" not in result.output
+    assert "valid default Project" in output
+    assert "bad\nname" not in output
+    assert str(config_file()) not in output
+    assert str(Path.home()) not in output
 
 
 def test_api_commands_use_the_saved_default_after_projects_use(

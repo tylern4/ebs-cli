@@ -30,24 +30,32 @@ this dedicated route verifies the Globus bearer and performs the same NERSC
 identity/LDAP/core account synchronization as the web callback before using
 normal personal-token creation. Ordinary `POST /api/v1/me/tokens` does not
 perform login synchronization and is not the native CLI minting endpoint. There
-is no web-client secret in the CLI and no authorization code to paste into the
-terminal.
+is no web-client secret in the CLI and the default local flow does not ask for
+an authorization code.
 
-For a windowless workstation, print the authorization URL instead of trying to
-open it:
+For an SSH session or other machine without a browser, use the manual code
+flow:
 
 ```sh
 ebs auth login --no-browser
 ```
 
-Open that URL in a browser **on the same workstation**: the loopback callback
-must reach the waiting CLI. The fixed port cannot be shared by another login or
-service. Denial, malformed callbacks, state mismatches, callback timeout, and
-unavailable Native App configuration fail without saving a login. Browser and
-refresh exchanges require HTTPS EBS/provider endpoints; real flows accept only
-the canonical `auth.globus.org` authorization/token endpoints (apart from
-explicitly injected test transports). The HTTP local-server example above is
-for manual-token development only.
+Open the displayed URL in a browser on any device. After login and consent,
+Globus displays a one-time authorization code. Copy only that code into the
+CLI's hidden prompt. The CLI does not open a port or callback listener in this
+mode, so no SSH port forward is needed. It uses Globus's native-app code-display
+redirect, preserves fresh state and S256 PKCE, and sends the same code-display
+redirect during token exchange. Do not paste a callback URL, token, or other
+credential.
+
+Only the default local flow uses the fixed loopback port, which cannot be shared
+by another login or service. Denial, malformed callbacks, state mismatches,
+callback timeout, and unavailable Native App configuration fail without saving
+a login. Manual cancellation, empty or malformed codes, and failed exchanges
+also fail without saving. Browser and refresh exchanges require HTTPS
+EBS/provider endpoints; real flows accept only the canonical `auth.globus.org`
+authorization/token endpoints (apart from explicitly injected test transports).
+The HTTP local-server example above is for manual-token development only.
 
 Only after both Globus and EBS token creation succeed does the CLI save the new
 personal token, Globus refresh credential, and public Native App client ID in a
@@ -82,7 +90,8 @@ ebs auth login --token
 `--token` is only a switch. It never takes a token value; do not put a token in
 a command argument, script, repository file, completion, or shell history. The
 prompt hides its input. This path updates the personal EBS token while keeping
-other config settings, including an existing saved Project.
+unrelated settings and an existing saved Project. It removes any older Globus
+grant so a standalone manually supplied token never renews through that grant.
 
 For an ephemeral shell or automation, prefer an environment variable:
 
@@ -94,10 +103,25 @@ echo
 
 `EBS_TOKEN` keeps its existing precedence over the config file for ordinary API
 requests. `EBS_PROJECT`, `--project`, and saved Project selection are unchanged.
-Authentication commands operate on saved credentials explicitly; unrelated API
-commands never silently exchange a Globus refresh credential.
+Environment and standalone manually supplied tokens never borrow a saved
+Globus grant for renewal.
 
-## Refresh and logout
+## Automatic renewal and explicit refresh
+
+Personal EBS tokens have a fixed lifetime of 48 hours after creation. There is
+no background timer or scheduled refresh. When an ordinary JSON API request
+using the saved file's token receives HTTP 401, the CLI checks for a complete
+Globus grant from the same saved snapshot. It exchanges that grant once,
+atomically saves the replacement EBS token and any rotated Globus grant with
+snapshot-conflict protection, updates the client's bearer header, and retries
+the original request exactly once. A second 401 fails without another renewal.
+
+Only authentication rejection triggers this behavior. HTTP 403, 404, redirects,
+5xx responses, and network failures do not. Renewal uses neither `EBS_TOKEN` nor
+a manually supplied token, and a changed saved file fails the conflict check
+instead of spending or overwriting credentials. The short-lived Globus access
+token remains in memory and is never saved. Bounded JSON API requests can be
+replayed once; direct S3 operations, streaming bodies, and redirects cannot.
 
 Use an existing saved Globus grant to rotate the personal EBS token explicitly:
 
@@ -140,15 +164,18 @@ revoke unneeded personal tokens in the EBS web interface.
 
 Register one **separate public Globus Native App**, with authorization-code and
 refresh-token grants and the `openid profile email offline_access` scopes. Do
-not create or configure a client secret. Its sole loopback redirect URI must be
-registered exactly as:
+not create or configure a client secret. Register both exact redirect URIs:
 
 ```text
 http://127.0.0.1:53682/oauth/callback
+https://auth.globus.org/v2/web/auth-code
 ```
 
-The scheme, numeric IPv4 loopback host, port, and path are all significant; do
-not substitute `localhost` or an ephemeral port. Configure only the resulting
+The first supports the default local callback and the second is Globus's
+official native-app code-display page for `--no-browser`. For loopback, the
+scheme, numeric IPv4 loopback host, port, and path are all significant; do not
+substitute `localhost` or an ephemeral port. Do not add other redirects.
+Configure only the resulting
 public client ID as user-api's `EBS_GLOBUS_CLI_CLIENT_ID` (Spin values key
 `auth.globusCliClientId`). Empty configuration makes
 `GET /api/v1/auth/cli-config` unavailable rather than exposing another client's

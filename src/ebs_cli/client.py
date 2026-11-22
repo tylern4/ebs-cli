@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from types import TracebackType
 from typing import Any
 from urllib.parse import urlsplit
@@ -94,6 +95,7 @@ class EBSClient:
         *,
         transport: httpx.BaseTransport | None = None,
         timeout: httpx.Timeout | float = 30.0,
+        renew_token: Callable[[], str] | None = None,
     ) -> None:
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         if project is not None:
@@ -105,6 +107,8 @@ class EBSClient:
             timeout=timeout,
             transport=transport,
         )
+        self._renew_token = renew_token
+        self._renewal_attempted = False
 
     def __enter__(self) -> "EBSClient":
         return self
@@ -132,16 +136,29 @@ class EBSClient:
         project_scoped: bool = True,
         allow_empty: bool = False,
     ) -> Any:
-        try:
-            response = self._http.request(
-                method, f"{API_PREFIX}{path}", params=params, json=json, headers=headers
-            )
-        except httpx.TimeoutException as exc:
-            raise CLIError("Request timed out. Check the server URL and retry.") from exc
-        except httpx.RequestError as exc:
-            raise CLIError(
-                "Could not reach the EBS server. Check the server URL and network connection."
-            ) from exc
+        def send() -> httpx.Response:
+            try:
+                return self._http.request(
+                    method, f"{API_PREFIX}{path}", params=params, json=json, headers=headers
+                )
+            except httpx.TimeoutException as exc:
+                raise CLIError("Request timed out. Check the server URL and retry.") from exc
+            except httpx.RequestError as exc:
+                raise CLIError(
+                    "Could not reach the EBS server. Check the server URL and network connection."
+                ) from exc
+
+        response = send()
+        if response.status_code == 401 and self._renew_token is not None and not self._renewal_attempted:
+            # Every caller supplies only bounded params and in-memory JSON. There
+            # are no streams or redirects to replay. A 401 precedes API mutation;
+            # PATCH/DELETE and credential-minting POSTs therefore retry only after
+            # fresh authentication, never after a server-side partial operation.
+            self._renewal_attempted = True
+            response.close()
+            token = self._renew_token()
+            self._http.headers["Authorization"] = f"Bearer {token}"
+            response = send()
 
         if response.is_success:
             if allow_empty and not response.content:

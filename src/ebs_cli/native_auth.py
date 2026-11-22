@@ -1,6 +1,7 @@
 """Globus Native App login for the CLI, without a confidential client."""
 
 import base64
+import getpass
 import hashlib
 import hmac
 import json
@@ -26,6 +27,7 @@ LOOPBACK_HOST = "127.0.0.1"
 LOOPBACK_PORT = 53682
 CALLBACK_PATH = "/oauth/callback"
 REDIRECT_URI = f"http://{LOOPBACK_HOST}:{LOOPBACK_PORT}{CALLBACK_PATH}"
+CODE_DISPLAY_REDIRECT_URI = "https://auth.globus.org/v2/web/auth-code"
 GLOBUS_SCOPE = "openid profile email offline_access"
 NERSC_IDP = "b2b0a937-3c52-40de-ad95-1b2a76285912"
 NERSC_DOMAIN = "nersc.gov"
@@ -95,14 +97,17 @@ def authorization_url(
     *,
     state: str,
     challenge: str,
+    redirect_uri: str = REDIRECT_URI,
 ) -> str:
     """Build the documented authorization-code + S256 Native App request."""
     _validate_endpoint(config.authorization_endpoint, allow_http=False)
+    if redirect_uri not in {REDIRECT_URI, CODE_DISPLAY_REDIRECT_URI}:
+        raise CLIError("An unsupported Globus Native App redirect was requested.")
     query = urlencode(
         {
             "response_type": "code",
             "client_id": config.client_id,
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "scope": GLOBUS_SCOPE,
             "state": state,
             "code_challenge": challenge,
@@ -433,32 +438,53 @@ def discover_native_client(
     return config
 
 
+def _read_authorization_code(prompt_code: Callable[[str], str] | None) -> str:
+    """Read a code through the hidden system prompt without reflecting its value."""
+    if prompt_code is None:
+        prompt_code = getpass.getpass
+    try:
+        supplied = prompt_code("Paste the one-time Globus authorization code (input is hidden): ")
+    except (EOFError, KeyboardInterrupt):
+        raise CLIError("Login was cancelled. Nothing was saved.") from None
+    if not isinstance(supplied, str):
+        raise CLIError("The authorization code was malformed. Nothing was saved. Retry login.")
+    code = supplied.strip()
+    if not code:
+        raise CLIError("No authorization code was supplied. Nothing was saved.")
+    if len(code) > 4096 or any(not character.isascii() or not character.isprintable() for character in code):
+        raise CLIError("The authorization code was malformed. Nothing was saved. Retry login.")
+    return code
+
+
 def browser_login(
     server_url: str,
     *,
     no_browser: bool = False,
     show_url: Callable[[str], None] | None = None,
+    prompt_code: Callable[[str], str] | None = None,
     transport: httpx.BaseTransport | None = None,
     callback_factory: Callable[[str], Any] = LoopbackCallback,
     open_browser: Callable[[str], bool] = webbrowser.open,
     wait_seconds: float = CALLBACK_WAIT_SECONDS,
 ) -> LoginCredentials:
-    """Complete browser login, then mint the personal token before saving."""
+    """Complete browser or manual-code login, then mint the personal token before saving."""
     config = discover_native_client(server_url, transport=transport)
     _validate_provider_configuration(config, allow_custom=transport is not None)
     state, verifier, challenge = generate_oauth_material()
-    url = authorization_url(config, state=state, challenge=challenge)
+    redirect_uri = CODE_DISPLAY_REDIRECT_URI if no_browser else REDIRECT_URI
+    url = authorization_url(config, state=state, challenge=challenge, redirect_uri=redirect_uri)
     # Test transports explicitly permit loopback/documentation HTTP fakes; real
     # requests require HTTPS before either endpoint or callback is contacted.
     _validate_endpoint(
         normalize_server_url(server_url),
         allow_http=transport is not None,
     )
-    with callback_factory(state) as callback:
-        if no_browser:
-            if show_url is not None:
-                show_url(url)
-        else:
+    if no_browser:
+        if show_url is not None:
+            show_url(url)
+        code = _read_authorization_code(prompt_code)
+    else:
+        with callback_factory(state) as callback:
             try:
                 opened = open_browser(url)
             except Exception:
@@ -468,8 +494,14 @@ def browser_login(
                     "Could not open a web browser. Retry with 'ebs auth login --no-browser' "
                     "and open the displayed URL yourself."
                 )
-        code = callback.wait(wait_seconds)
-    tokens = _exchange_code(config, code=code, verifier=verifier, transport=transport)
+            code = callback.wait(wait_seconds)
+    tokens = _exchange_code(
+        config,
+        code=code,
+        verifier=verifier,
+        redirect_uri=redirect_uri,
+        transport=transport,
+    )
     personal_token = _mint_personal_token(
         server_url,
         tokens.access_token,
@@ -487,7 +519,7 @@ def refresh_login(
     *,
     transport: httpx.BaseTransport | None = None,
 ) -> LoginCredentials:
-    """Use a saved grant only for this explicit command, never on API calls."""
+    """Use a saved grant for explicit refresh or one reactive saved-login API renewal."""
     config = discover_native_client(server_url, transport=transport)
     _validate_provider_configuration(config, allow_custom=transport is not None)
     if not hmac.compare_digest(config.client_id, client_id):
@@ -544,6 +576,7 @@ def _exchange_code(
     *,
     code: str,
     verifier: str,
+    redirect_uri: str,
     transport: httpx.BaseTransport | None,
 ) -> _ProviderTokens:
     response = _request(
@@ -555,7 +588,7 @@ def _exchange_code(
             "grant_type": "authorization_code",
             "code": code,
             "client_id": config.client_id,
-            "redirect_uri": REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "code_verifier": verifier,
         },
     )
