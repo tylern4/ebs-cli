@@ -77,19 +77,19 @@ The simplest form is one full S3 URI, matched as a **glob**:
 ```yaml
 pipeline:
   input_type: s3_bucket_events
-  matchers: s3://cfs/????-??-??/*.list.allfiles
+  matchers: s3://example-input-bucket/????-??-??/reports.txt
 ```
 
 - `s3://bucket` or `s3://bucket/` selects a whole bucket; `s3://bucket/incoming/` selects that literal prefix.
 - In the pattern part, `*` and `?` are wildcards; every other character matches literally (glob syntax, not a regular expression).
-- Limits: at most 12 `*`/`?` wildcards, a 256-character path, and one lowercase dot-suffix (up to 32 characters) after the last `*`, such as `.nc` or `.list.allfiles`.
+- Limits: at most 12 `*`/`?` wildcards, a 256-character path, and one lowercase dot-suffix (up to 32 characters) after the last `*`, such as `.nc` or `.txt`.
 
 For fuller patterns, the `regex:` shorthand matches keys with a raw **RE2 regular expression** instead (Go `regexp` syntax):
 
 ```yaml
 matchers:
-  s3_bucket: cfs
-  path_regex: ^\d{4}-\d{2}-\d{2}/.*\.list\.allfiles$
+  s3_bucket: example-input-bucket
+  path_regex: ^\d{4}-\d{2}-\d{2}/reports\.txt$
 ```
 
 Key differences from the glob shorthand: the pattern is a raw RE2 expression over the complete object key relative to the bucket, it is **not implicitly anchored** — write `^` and `$` when you want whole-key matching — and a raw `*` repeats the preceding expression rather than meaning "anything". Keep the pattern nonblank and at most 256 characters.
