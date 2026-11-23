@@ -2,15 +2,7 @@
 
 Return to the [guide index](index.md).
 
-## Connect to the service
-
-The CLI talks to the EBS web service at <https://ebs-poc.nersc.gov> by default. To point it somewhere else, set `--url` or `EBS_URL` to the server's origin:
-
-```sh
-export EBS_URL=http://localhost:8000
-```
-
-Use a plain `http://` or `https://` origin. Do not add a path such as `/api/v1`, a query string, or credentials.
+The CLI connects to [NERSC Event Based Scheduling](https://ebs-poc.nersc.gov).
 
 ## Log in with your browser
 
@@ -115,7 +107,7 @@ ebs triggers list
 You can still override the default for a single call; global options come before the command group:
 
 ```sh
-ebs --project physics --url http://localhost:8000 triggers list
+ebs --project physics triggers list
 ```
 
 Without any Project selected, API commands fail with guidance to run `ebs projects list` and `ebs projects use PROJECT`.
