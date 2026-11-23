@@ -85,6 +85,11 @@ class MatchersDocument(DocumentModel):
     s3_bucket: str | None = None
     path_prefix: str | None = None
     path_glob: str | None = None
+    # A raw RE2 regular expression over the complete object key relative
+    # to s3_bucket, forwarded verbatim: the CLI never evaluates it and the
+    # server stays authoritative for RE2 syntax, the 256-character cap,
+    # and the path_prefix/path_glob/path_regex mutual exclusion.
+    path_regex: str | None = None
     file_types: list[str] | None = None
     job_states: list[str] | None = None
     job_name: str | None = None
@@ -99,11 +104,51 @@ _S3_FILE_TYPE = re.compile(r"\.[a-z0-9]+(\.[a-z0-9]+)*")
 _MAX_FILE_TYPE_CHARS = 32
 _MAX_PATH_GLOB_CHARS = 256
 _MAX_PATH_GLOB_WILDCARDS = 12
+# The shared raw-regex cap: the same 256-character bound the structured
+# matcher carries, enforced only on the scalar shorthand here.
+_MAX_PATH_REGEX_CHARS = 256
+# The explicit raw-regex scalar prefix; lowercase only, so a different
+# case falls through to the s3:// parser and fails there.
+_REGEX_SCALAR_PREFIX = "regex:"
+
+
+def _s3_regex_matchers(rest: str) -> dict[str, Any]:
+    """Translate the explicit ``regex:s3://bucket/<raw>`` scalar.
+
+    Only the bucket split and the shared nonblank/256-character raw cap
+    are checked: the raw regular expression is forwarded verbatim (no glob
+    decomposition, prefix conversion, wildcard count, or file-type
+    inference, and no local evaluation), so every RE2 feature reaches the
+    server unchanged. Messages are fixed and never echo the authored
+    pattern.
+    """
+    if not rest.lower().startswith("s3://"):
+        raise ValueError("S3 regex matcher scalar must be a full regex:s3://bucket/<pattern> URI")
+    rest = rest[len("s3://") :]
+    slash = rest.find("/")
+    if slash < 0:
+        raise ValueError("S3 regex matcher URI must include a slash and a nonblank raw pattern")
+    bucket = rest[:slash]
+    if not bucket.strip():
+        raise ValueError("S3 regex matcher URI must include a nonblank bucket")
+    # Everything after the first slash is the raw pattern, including any
+    # further slashes and retained literal spaces: only the whole scalar's
+    # existing outer whitespace trim has run, nothing inside is trimmed.
+    raw = rest[slash + 1 :]
+    if not raw.strip():
+        raise ValueError("S3 regex matcher URI must include a nonblank raw pattern")
+    if len(raw) > _MAX_PATH_REGEX_CHARS:
+        raise ValueError("S3 regex matcher pattern must contain at most 256 characters")
+    return {"s3_bucket": bucket, "path_regex": raw}
 
 
 def _s3_pattern_matchers(pattern: str) -> dict[str, Any]:
     """Translate the frontend's bounded S3 glob form without echoing input."""
     rest = pattern.strip()
+    if rest.startswith(_REGEX_SCALAR_PREFIX):
+        # The explicit raw-RE2 form dispatches before the glob parser so
+        # its syntax is never read as glob metacharacters.
+        return _s3_regex_matchers(rest[len(_REGEX_SCALAR_PREFIX) :])
     if not rest.lower().startswith("s3://"):
         raise ValueError("S3 matcher scalar must be a full s3://bucket/<key-pattern> URI")
     rest = rest[len("s3://") :]

@@ -313,6 +313,219 @@ def test_existing_structured_s3_matchers_are_unchanged() -> None:
     assert canonical_pipeline(parsed.pipeline)["matchers"] == matchers
 
 
+# The owner's raw-RE2 example: a date-directory prefix with a literal-dot
+# suffix, matched with ordinary RE2 search semantics.
+OWNER_PATH_REGEX = r"^\d{4}-\d{2}-\d{2}/.*\.list\.allfiles$"
+OWNER_REGEX_SCALAR = f"regex:s3://cfs/{OWNER_PATH_REGEX}"
+OWNER_REGEX_MATCHERS = {"s3_bucket": "cfs", "path_regex": OWNER_PATH_REGEX}
+
+
+@pytest.mark.parametrize("syntax", ["json", "yaml"])
+def test_regex_scalar_owner_example_parses_verbatim(syntax: str) -> None:
+    body = document()
+    body["pipeline"]["matchers"] = OWNER_REGEX_SCALAR
+    content = json.dumps(body) if syntax == "json" else yaml.safe_dump(body)
+
+    parsed = parse_trigger_document(content.encode(), syntax)
+
+    assert parsed.pipeline.matchers.model_dump(exclude_none=True) == OWNER_REGEX_MATCHERS
+    assert canonical_pipeline(parsed.pipeline)["matchers"] == OWNER_REGEX_MATCHERS
+    # The raw leaf reaches the canonical state byte-identical: no glob
+    # decomposition, prefix conversion, or file-type inference ran.
+    assert parsed.pipeline.matchers.file_types is None
+    assert parsed.pipeline.matchers.path_glob is None
+    assert parsed.pipeline.matchers.path_prefix is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        r"^run_\d+\.log(\.gz)?$",
+        r"^(a|b){2,4}/part-(?:one|two)\.dat$",
+        r"(?i)^nightly-build.*\.tar\.bz2$",
+        "????-??-??/*",
+        r"^spaces  inside  key$",
+    ],
+)
+def test_regex_scalar_keeps_raw_syntax_slashes_and_spaces(raw: str) -> None:
+    body = document()
+    body["pipeline"]["matchers"] = f"regex:s3://b/{raw}"
+
+    parsed = parse_trigger_document(json.dumps(body).encode(), "json")
+
+    assert parsed.pipeline.matchers.model_dump(exclude_none=True) == {
+        "s3_bucket": "b",
+        "path_regex": raw,
+    }
+
+
+def test_regex_scalar_keeps_outer_trim_only_and_inner_spaces() -> None:
+    body = document()
+    # Only the scalar's existing outer whitespace trim runs: the space
+    # between the bucket slash and the pattern is part of the raw value.
+    body["pipeline"]["matchers"] = "  regex:s3://b/ ^anchored$  "
+
+    parsed = parse_trigger_document(json.dumps(body).encode(), "json")
+
+    assert parsed.pipeline.matchers.model_dump(exclude_none=True) == {
+        "s3_bucket": "b",
+        "path_regex": " ^anchored$",
+    }
+
+
+def test_regex_scalar_applies_no_glob_caps_or_file_type_inference() -> None:
+    body = document()
+    # 13 '?' wildcards (over the glob cap) plus a '.jpeg'-like tail and a
+    # '*.tmp' middle: all pass through as raw RE2 with no translation.
+    raw = "?" * 13 + "/*mid*.jpeg"
+    body["pipeline"]["matchers"] = f"regex:s3://private-bucket/{raw}"
+
+    parsed = parse_trigger_document(json.dumps(body).encode(), "json")
+
+    assert parsed.pipeline.matchers.model_dump(exclude_none=True) == {
+        "s3_bucket": "private-bucket",
+        "path_regex": raw,
+    }
+    assert parsed.pipeline.matchers.file_types is None
+    assert parsed.pipeline.matchers.path_glob is None
+
+
+def test_structured_path_regex_combines_with_other_filters() -> None:
+    matchers = {
+        "event_type": "s3.object.created",
+        "s3_events": ["s3.object.created", "s3.object.deleted"],
+        "s3_bucket": "cfs",
+        "path_regex": OWNER_PATH_REGEX,
+        "file_types": [".list.allfiles"],
+        "user": "example",
+    }
+    body = document()
+    body["pipeline"]["matchers"] = copy.deepcopy(matchers)
+
+    parsed = parse_trigger_document(json.dumps(body).encode(), "json")
+
+    assert canonical_pipeline(parsed.pipeline)["matchers"] == matchers
+
+
+def test_regex_scalar_create_and_apply_send_only_canonical_matchers(
+    runner: CliRunner, document_api: DocumentAPI, tmp_path: Path
+) -> None:
+    body = document()
+    body["pipeline"]["matchers"] = OWNER_REGEX_SCALAR
+    path = write_document(tmp_path / "trigger.json", body)
+
+    created = runner.invoke(app, ["triggers", "create", "--file", str(path), "--json"])
+
+    assert created.exit_code == 0, created.output
+    payload = document_api.calls[-1][1]
+    assert payload["pipeline"]["matchers"] == OWNER_REGEX_MATCHERS
+
+
+def test_regex_scalar_matches_existing_structured_state_without_patch(
+    runner: CliRunner, document_api: DocumentAPI, tmp_path: Path
+) -> None:
+    stored = document()
+    stored["pipeline"]["matchers"] = dict(OWNER_REGEX_MATCHERS)
+    document_api.current = response_for({**stored, "sfapi_token_ref": None, "sfapi_account": None})
+    authored = document()
+    authored["pipeline"]["matchers"] = OWNER_REGEX_SCALAR
+    path = write_document(tmp_path / "trigger.yaml", authored)
+
+    result = runner.invoke(app, ["triggers", "apply", "--file", str(path), "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["action"] == "unchanged"
+    assert not any(call[0] in {"create_trigger", "update_trigger"} for call in document_api.calls)
+
+
+def test_regex_structured_export_then_apply_is_noop(
+    runner: CliRunner, document_api: DocumentAPI, tmp_path: Path
+) -> None:
+    stored = document()
+    structured = {
+        "event_type": "s3.object.created",
+        "s3_bucket": "cfs",
+        "path_regex": OWNER_PATH_REGEX,
+    }
+    stored["pipeline"]["matchers"] = structured
+    set_export(document_api, stored)
+    exported = runner.invoke(app, ["triggers", "export", "data-ready"])
+    assert exported.exit_code == 0, exported.output
+    assert yaml.safe_load(exported.stdout)["pipeline"]["matchers"] == structured
+    path = tmp_path / "regex-roundtrip.yaml"
+    path.write_text(exported.stdout, encoding="utf-8")
+    document_api.current = document_api.export_trigger
+    document_api.export_trigger = None
+
+    applied = runner.invoke(app, ["triggers", "apply", "--file", str(path), "--json"])
+
+    assert applied.exit_code == 0, applied.output
+    assert json.loads(applied.stdout)["action"] == "unchanged"
+    assert not any(call[0] in {"create_trigger", "update_trigger"} for call in document_api.calls)
+
+
+@pytest.mark.parametrize(
+    "pattern,secret",
+    [
+        ("regex:", None),
+        ("regex", None),
+        ("Regex:s3://b/^a$", "^a$"),
+        ("regex:s3://", None),
+        ("regex:s3://private-bucket", "private-bucket"),
+        ("regex:s3:///runs/ebs_private_marker", "ebs_private_marker"),
+        ("regex:s3://   /runs/ebs_private_marker", "ebs_private_marker"),
+        ("regex:s3://private-bucket/", "private-bucket"),
+        ("regex:s3://private-bucket/   ", "private-bucket"),
+        ("regex:s3://private-bucket/^" + "a" * 257 + "$", "a" * 257),
+    ],
+)
+def test_invalid_regex_scalar_is_private_and_fails_before_client_construction(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pattern: str,
+    secret: str | None,
+) -> None:
+    body = document()
+    body["pipeline"]["matchers"] = pattern
+    path = write_document(tmp_path / "trigger.json", body)
+
+    def should_not_construct(*args: Any):
+        raise AssertionError("client constructed for invalid S3 regex matcher")
+
+    monkeypatch.setattr(cli, "_normal_api_client", should_not_construct)
+    result = runner.invoke(app, ["triggers", "apply", "--file", str(path)])
+
+    assert result.exit_code == 2
+    assert "pipeline.matchers" in result.stderr
+    output = result.stdout + result.stderr
+    if secret is not None:
+        assert secret not in output
+    if pattern.strip() not in {"regex", "regex:"}:
+        assert pattern not in output
+    assert "ebs_private_marker" not in output
+    assert "a" * 257 not in output
+
+
+def test_regex_scalar_is_forbidden_for_job_events(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    body = document(callback=True)
+    body["pipeline"]["matchers"] = OWNER_REGEX_SCALAR
+    path = write_document(tmp_path / "trigger.json", body)
+
+    def should_not_construct(*args: Any):
+        raise AssertionError("client constructed for job regex matcher scalar")
+
+    monkeypatch.setattr(cli, "_normal_api_client", should_not_construct)
+    result = runner.invoke(app, ["triggers", "create", "--file", str(path)])
+
+    assert result.exit_code == 2
+    assert "pipeline.matchers" in result.stderr
+    assert "job-event matchers must be a structured object" in result.stderr
+    assert OWNER_REGEX_SCALAR not in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("command", ["create", "apply"])
 @pytest.mark.parametrize("syntax", ["json", "yaml"])
 def test_s3_uri_create_and_apply_send_only_canonical_matchers(

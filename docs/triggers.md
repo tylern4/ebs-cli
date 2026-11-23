@@ -111,9 +111,48 @@ that literal prefix. The part after the final `*` can be one lowercase dot-suffi
 wildcards and a 256-character path. This is glob syntax, not raw regular expression
 syntax: `*` and `?` are wildcards, while all other regex metacharacters match literally.
 
+For fuller patterns, the explicit `regex:` shorthand selects keys with a raw RE2 regular
+expression instead of a glob:
+
+```yaml
+pipeline:
+  input_type: s3_bucket_events
+  matchers: regex:s3://cfs/^\d{4}-\d{2}-\d{2}/.*\.list\.allfiles$
+```
+
+The CLI translates that scalar before any API request to `s3_bucket: cfs` plus a
+`path_regex` field carrying the raw pattern exactly as written. The same matcher in the
+structured form:
+
+```yaml
+matchers:
+  s3_bucket: cfs
+  path_regex: ^\d{4}-\d{2}-\d{2}/.*\.list\.allfiles$
+```
+
+The value is a raw RE2 regular expression (the syntax implemented by Go `regexp`) over
+the complete object key relative to the bucket, with ordinary search semantics: it is not
+implicitly anchored to the whole key, so author `^` and `$` when whole-key matching is
+wanted. Backreferences, look-around, and the C++-only `\C` byte escape are invalid. A
+`\Q...\E` literal quote must include its closing `\E`. Noncapturing groups `(?:…)`,
+counted repetitions `{2,4}`, alternation `|`, and inline flags such as `(?i)` work. A raw `*`
+repeats the preceding expression; it does not have the glob's standalone-anything
+meaning. The pattern must be nonblank and at most 256 characters, the `regex:` prefix is
+lowercase, the bucket must be nonblank, and the raw pattern is carried verbatim — literal
+spaces inside it are kept. The glob shorthand is unchanged: `s3://bucket/<pattern>`
+remains a bounded glob where `*` and `?` are wildcards and every other character matches
+literally.
+
+`path_prefix`, `path_glob`, and `path_regex` are mutually exclusive — author one key
+matcher — and combine freely with the other filters, including `s3_events` and
+`file_types`. The example above matches
+`2026-11-04/mmapplypolicy.1539061.81DE84C7.list.allfiles` and does not match a
+date-shaped key whose year contains letters.
+
 Use a structured matchers object to combine a pattern with S3 event types or any other
 filter. Job-event matchers must also be structured objects. Export emits the canonical
-structured object, so an exported trigger can be applied without an update.
+structured object, including a stored `path_regex` unchanged, so an exported trigger can
+be applied without an update.
 
 #### S3 start-job with a scheduler-hosted script
 
