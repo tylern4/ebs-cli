@@ -2,44 +2,34 @@
 
 Return to the [guide index](index.md), or follow the [companion web interface walkthrough](fits-starfinder-web-ui.md).
 
-This walkthrough creates an S3 trigger named `fits-starfinder`, uploads FITS objects below `incoming/`, and starts one Slurm batch job per accepted object. Each job downloads its triggering object through the event's presigned GET URL and runs an explicitly illustrative command:
+This walkthrough creates an S3 trigger named `fits-starfinder`, uploads FITS objects below `incoming/`, and gets one Slurm batch job per accepted object. Each job downloads its object and runs a mock `starfinder` command that writes a CSV catalog.
 
-```sh
-starfinder --input input.fits --output catalog.csv --threshold 5
-```
-
-**`starfinder` is a mock application.** EBS does not provide or install it. Replace it with software and paths available on your compute system, and make sure the batch job can run that command. The CSV shown later is synthetic documentation content, not output from a run performed for this guide.
-
-All Project, bucket, machine, Username, and Account values below are synthetic. Replace them with values available to you before running the commands. No sample input FITS file is supplied; use your own valid input.
+**`starfinder` is an illustrative mock, not software provided by EBS.** Supply a compatible executable on your compute system, or replace the command with software you have. All Project, bucket, machine, Username, and Account values below are synthetic; replace them with your own. No sample input FITS file is supplied (the companion guide shows how to make a small synthetic one).
 
 ## Prerequisites
 
-1. Install the CLI and authenticate as described in the [quick start](../README.md#quick-start) and [authentication guide](authentication.md):
+1. Install the CLI and authenticate ([quick start](../README.md#quick-start), [authentication guide](authentication.md)):
 
    ```sh
    ebs auth login
    ```
 
-   On a machine without a browser, use `ebs auth login --no-browser` instead.
+   Use `ebs auth login --no-browser` on a machine without a browser.
 
-2. You need access to a Project, permission to manage this trigger, and a provisioned input bucket for that Project. This guide uses `example-project` and `example-input-bucket`; substitute your exact Project and bucket names.
+2. Access to a Project with a provisioned input bucket and permission to manage triggers. Confirm the Project you will use:
 
-3. In the web interface's **Settings** page, the **SFAPI clients** section must already contain an unexpired client eligible to submit jobs. Use its listed scheduler Username and one of its available Accounts in place of `example-user` and `example-account`. The YAML selects that client through non-secret metadata; never put a client secret, private key, API token, or credential reference in the document.
+   ```sh
+   ebs projects list
+   ebs --project example-project projects show
+   ```
 
-4. Replace `example-scheduler` with an available scheduler machine. On its compute nodes, provide the mock `starfinder` executable or your replacement, `curl`, and a valid `$SCRATCH` directory.
+3. In the web interface's **Settings → SFAPI clients**, an unexpired client eligible to submit jobs, listed with its scheduler Username and available Accounts. You will use that Username and one of its Accounts in the YAML; never put a client secret or any credential in the document.
 
-The commands use an explicit global `--project example-project` option so they cannot accidentally use a different saved or environment-selected Project. Check that your replacement appears in your Project list and that the explicit selection is effective:
+4. On the scheduler machine: `curl`, a writable `$SCRATCH`, and the mock `starfinder` executable (or your replacement) available to batch jobs.
 
-```sh
-ebs projects list
-ebs --project example-project projects show
-```
+## The trigger document
 
-The explicit option takes precedence over `EBS_PROJECT` and the saved default. Alternatively, `ebs projects use PROJECT` saves a default, but do not mix that convention with the explicit commands in this walkthrough. See [Authentication and Projects](authentication.md#discover-projects-and-set-a-default).
-
-## Save the trigger document
-
-Save the following complete document as `fits-starfinder.yaml` after replacing every synthetic value:
+The complete example document is [the example YAML](../examples/fits-starfinder.yaml) in the CLI repository. Open it and replace every synthetic value — `example-project`, `example-input-bucket`, `example-scheduler`, `example-user`, `example-account` — with your own. For reference, the document contains:
 
 ```yaml
 name: fits-starfinder
@@ -83,91 +73,70 @@ pipeline:
         test -s catalog.csv
 ```
 
-The matchers require **all** of these conditions: an object-creation event in the selected bucket, a key beginning with `incoming/`, and a lowercase `.fits` or `.fit` suffix. Thus `incoming/run-42.fits` and `incoming/run-43.fit` each produce one event and one batch job; objects outside that prefix or with other suffixes do not match. Each accepted upload is independent.
+How to read it:
 
-The `source: template` value stores this inline Jinja2 script in the trigger. For this file-event family, `event.account` supplies the selected Account, `job.id` supplies the service job ID, and `s3.presigned_url` supplies the triggering object's download URL. The script deliberately uses fixed local names, `input.fits` and `catalog.csv`; it never interpolates an object key or user-controlled filename into shell syntax.
-
-The Slurm resources are static: one node, one task, four CPUs, and ten minutes. An S3 event does not carry resource values such as `event.nodes`, so do not use job-event fields to size this allocation.
-
-The presigned URL is a temporary bearer credential for reading the object. It is not a public or permanent link; do not print it, copy it into logs, or share it. The event supplies an expiry as well, and a job that remains queued too long can start after its URL has expired. In that case `curl` fails and `set -e` stops the script. This example does not provide durable input staging or refresh the URL when the batch job eventually starts.
-
-`set -euo pipefail` and the `curl` failure options stop the job after a failed download rather than treating that failure as valid FITS input. The final `test -s catalog.csv` requires a nonempty catalog, but neither that check nor a successful command exit validates the catalog's schema or scientific results. Inspect the file after completion as shown below.
-
-If you instead choose `source: path`, its `path` must name an **already existing file on the scheduler**. Neither that form nor this inline form uploads a local script. The `source: path` contract also differs on Account selection; this walkthrough requires an Account because its inline template uses one. See [Triggers and events](triggers.md#s3-start-job-with-a-scheduler-hosted-script).
+- **Matchers:** all conditions must hold — an object-creation event in the selected bucket, a key beginning with `incoming/`, and a lowercase `.fits` or `.fit` suffix. So `incoming/run-42.fits` and `incoming/run-43.fit` each produce one event and one job.
+- **`source: template`** stores this inline Jinja2 script in the trigger. Use `source: path` instead only to reference a script that already exists on the scheduler's filesystem; neither choice uploads a local file.
+- **Slurm resources are static** (one node, one task, four CPUs, ten minutes); an S3 event does not carry resource values, so size the allocation in the script. **`{{ event.account }}`** is filled from the selected Account, which is why `sfapi_username` and `sfapi_account` are required here.
+- **`{{ job.id }}`** is the EBS job record ID, not the scheduler job ID and not a field of the S3 event. It names each job's output directory: `$SCRATCH/starfinder/{{ job.id }}/`.
+- **`{{ s3.presigned_url }}`** becomes a short-lived presigned GET URL for the triggering object. Treat it as a secret while valid, and note that it is created when the event is processed — a job queued past the URL's expiry fails at the `curl` step.
 
 ## Apply the trigger
 
-**This is a real create or full-state update operation, not a dry run.** For the exact Project/name identity, `apply` creates a missing trigger, replaces the mutable configuration of an existing one, or reports that it is unchanged. Because this document has `enabled: true`, a successfully applied trigger can process matching uploads. The separate sample-event **Test/Verify** action in the web interface is only a simulation: it neither uploads a file nor submits a job.
-
-Run:
+From the repository root — the directory containing `examples/`:
 
 ```sh
-ebs --project example-project triggers apply --file fits-starfinder.yaml
-```
-
-The server remains authoritative for access, matcher, template, machine, and credential eligibility checks. Confirm the trigger after applying it:
-
-```sh
+ebs --project example-project triggers apply --file examples/fits-starfinder.yaml
 ebs --project example-project triggers show fits-starfinder
 ```
 
-For apply semantics, complete-document updates, and other trigger commands, see [Creating and applying JSON or YAML documents](triggers.md#creating-and-applying-json-or-yaml-documents).
+**`apply` is a real create or full-state update, not a dry run.** With `enabled: true`, a successfully applied trigger can submit real jobs for matching uploads.
+
+See [Creating and applying JSON or YAML documents](triggers.md#creating-and-applying-json-or-yaml-documents).
 
 ## Upload FITS objects
 
-Put a valid local FITS file at `./run-42.fits`, then upload it to the exact matching key:
+Upload a valid local FITS file to the exact matching key:
 
 ```sh
 ebs --project example-project s3 upload fits-starfinder ./run-42.fits --key incoming/run-42.fits
 ```
 
-To demonstrate the other accepted suffix and an independent second event/job, use another valid local file and run this separate upload:
+To also exercise the other accepted suffix, upload a second file separately — each upload is one independent event and job:
 
 ```sh
 ebs --project example-project s3 upload fits-starfinder ./run-43.fit --key incoming/run-43.fit
 ```
 
-Each command uploads exactly one file directly to the trigger's bucket using temporary upload-scoped access; it neither prints those temporary credentials nor sends the object body through the EBS API. A successful upload is not a claim that its event has already been processed or that its job has finished. See [Upload a local file](s3.md#upload-a-local-file).
-
-List a bounded page below the input prefix to verify the object keys:
+Verify the stored keys with a bounded listing:
 
 ```sh
 ebs --project example-project s3 ls fits-starfinder --prefix incoming/ --limit 100
 ```
 
-You should find `incoming/run-42.fits` and, if you ran the second upload, `incoming/run-43.fit`. Listing proves that the objects are stored, not that corresponding jobs are complete. See [List objects](s3.md#list-objects).
+Listing proves the objects are stored, not that their jobs have finished. See [Upload a local file](s3.md#upload-a-local-file) and [List objects](s3.md#list-objects).
 
 ## Inspect events and jobs
-
-The CLI reports each job together with its triggering event:
 
 ```sh
 ebs --project example-project events list fits-starfinder --source s3 --limit 50
 ```
 
-Expect one event row per accepted object. The table includes the event status, the associated **Job ID**, job status, and any recorded failure. Use the **Job ID** from the relevant event—not the separate scheduler submission ID—as the `job.id` directory component in the next section.
+Expect one row per accepted object, with the event status, **Job ID**, and job status. Use the **Job ID** — not the separate scheduler submission ID — in the next step. Add `--json` for machine-readable fields, and use the returned `--cursor` to page further. Submission and completion are asynchronous; poll again later if a job has not finished. See [Events and jobs](triggers.md#events-and-jobs).
 
-For stable machine-readable fields, including the job's `id` and scheduler-side `sfapi_job_id`, use:
+## Inspect the catalog on the scheduler
 
-```sh
-ebs --project example-project events list fits-starfinder --json
-```
-
-Each request is one bounded page; use the returned cursor with `--cursor` if more events are available. Job submission and completion are asynchronous, so poll later if a job has not finished. The ordinary table does not print event payloads or rendered job scripts. See [Events and jobs](triggers.md#events-and-jobs).
-
-## Inspect the source catalog on the scheduler
-
-After the scheduler reports the job complete, inspect the output on that scheduler. Replace `SERVICE_JOB_ID` with the event row's service **Job ID**:
+After the job completes, on the scheduler replace `JOB_ID` with the event row's **Job ID**:
 
 ```sh
-catalog="$SCRATCH/starfinder/SERVICE_JOB_ID/catalog.csv"
+catalog="$SCRATCH/starfinder/JOB_ID/catalog.csv"
 test -s "$catalog"
 head -n 6 "$catalog"
 ```
 
-Here `test -s` requires the catalog to exist and contain at least one byte; `head` merely displays the first lines. Neither command validates the scientific results. If the path is missing, confirm that you used the service Job ID from `events list` and inspect that event's job status and recorded failure before treating the upload as successful processing.
+If the file is missing, recheck the Job ID and that event's job status and failure reason before troubleshooting further.
 
-For this walkthrough only, a clearly synthetic mock catalog might have this content:
+For this mock's output convention, a catalog has the columns `source_id`, `ra_deg`, `dec_deg`, `flux`, and `snr` (identifier, coordinates in degrees, flux, and signal-to-noise ratio). This is invented sample content showing the shape, not output from a run:
 
 ```csv
 source_id,ra_deg,dec_deg,flux,snr
@@ -175,4 +144,12 @@ MOCK-001,150.125000,2.250000,125.0,12.5
 MOCK-002,150.130000,2.255000,80.0,9.0
 ```
 
-These rows are invented sample content and are **not measurements produced by a performed run**. A real catalog's columns depend on the replacement application. In this example's mock output convention, `source_id` identifies a detection, `ra_deg` and `dec_deg` are right ascension and declination in degrees, `flux` is instrumental, background-subtracted flux in application-defined units, and `snr` is the signal-to-noise ratio. Have your analysis tools parse the actual `catalog.csv`, check its header and rows against your application's schema, and evaluate detections against your scientific criteria. A completed EBS job state does not by itself prove catalog validity.
+Your replacement application defines its own columns and conventions — check its exit status, logs, and output against its documentation.
+
+## Related guides
+
+- [FITS pipeline with the web interface](fits-starfinder-web-ui.md)
+- [Triggers and events](triggers.md)
+- [S3 operations and boto3](s3.md)
+- [Authentication and Projects](authentication.md)
+- [Guide index](index.md)

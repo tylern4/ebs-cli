@@ -25,46 +25,20 @@ Log in through Globus in your browser:
 ebs auth login
 ```
 
-The CLI uses a Native App authorization-code + PKCE flow, then saves the
-personal EBS token, Globus refresh credential, and public client ID together in
-an owner-only config file. No web-client secret or short-lived access token is
-saved. Personal tokens expire after 48 hours. If an ordinary API request then
-receives HTTP 401, the saved Globus grant replaces the token and retries once;
-this never applies to `EBS_TOKEN`, manual token login, or direct S3 operations.
-Use `ebs auth refresh` for an explicit earlier rotation, and `ebs auth logout`
-to clear both saved login credentials (plus revocation of the CLI grant when
-Globus confirms it). Over SSH, run `ebs auth login --no-browser`,
-open the displayed URL on any device, and paste the Globus one-time code into
-the hidden prompt. This mode opens no local callback listener.
+On a machine without a browser (for example, over SSH), use `ebs auth login --no-browser` instead: open the displayed URL anywhere, and paste the one-time code into the hidden prompt. For automation or a token created in the web interface, use `ebs auth login --token` and paste it at the hidden prompt. See [Authentication and Projects](docs/authentication.md) for all login options.
 
-For manual token bootstrap or automation, `ebs auth login --token` selects a
-hidden prompt for a personal token from the web interface. `--token` is only a
-switch and never accepts a value, keeping credentials out of command arguments
-and shell history. `EBS_TOKEN` remains available for ephemeral environments.
+Personal tokens expire after 48 hours. With a saved browser login, the CLI renews the token automatically the next time you run a command; use `ebs auth refresh` to rotate it early and `ebs auth logout` to log out. A token supplied with `--token` or `EBS_TOKEN` is not renewed this way — log in again when it expires.
 
-List your Projects and save a default:
+## Pick a Project and run your first commands
+
+List your Projects and save a default, using the exact name from the list. The listing also shows a `Triggers` count per Project (`trigger_count` with `--json`), so you can see which Projects have triggers configured:
 
 ```sh
 ebs projects list
 ebs projects use PROJECT
 ```
 
-Use the exact Project name from the list. After this, plain commands work without flags or environment variables.
-
-The Project listing also shows a `Triggers` count per Project (`trigger_count` with `--json`), so you can see which Projects have triggers configured before listing them individually:
-
-```sh
-$ ebs projects list
-Projects
-┏━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━┓
-┃ Project ┃ Role        ┃ Triggers ┃
-┡━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━┩
-│ alpha   │ maintainer  │        2 │
-│ zeta    │ user        │        0 │
-└─────────┴─────────────┴──────────┘
-```
-
-A few first commands:
+After this, plain commands work without flags or environment variables:
 
 ```sh
 ebs triggers list
@@ -86,9 +60,14 @@ ebs s3 upload TRIGGER ./data.fits
 | [FITS pipeline with the web interface](docs/fits-starfinder-web-ui.md) | Upload FITS files and process them with a mock `starfinder` batch-job trigger |
 | [FITS pipeline with the CLI](docs/fits-starfinder-cli.md) | The same mock star-finding workflow with YAML trigger documents and `ebs` commands |
 | [Web interface](docs/web-interface.md) | Signing in, Projects, tokens, triggers, events, and upload access in the browser |
-| [Authentication and Projects](docs/authentication.md) | Globus browser login, manual tokens, refresh/logout, config security, and Project precedence |
+| [Authentication and Projects](docs/authentication.md) | Login options, token refresh and logout, and choosing a Project |
 | [Triggers and events](docs/triggers.md) | Listing, filtering, pagination, trigger references |
 | [S3 operations and boto3](docs/s3.md) | Scoped temporary credentials, object commands, uploads, presigned URLs |
-| [Development and CI](docs/development.md) | Tests, linting, builds, and continuous integration |
+| [Development and CI](docs/development.md) | For contributors: tests, linting, builds, and continuous integration |
 
-The CLI uses personal EBS API tokens. It never asks for the object store's root key or system credentials, and it keeps your EBS token and S3 credentials out of each other's requests. One exception is deliberate: `ebs s3 credentials` prints the temporary access key, secret key, and session token to stdout, so protect that output and keep it out of logs and shared terminals. The direct S3 commands (`s3 ls`, `s3 download`, `s3 rm`, `s3 upload`) do not display temporary credentials, and signed URLs stay redacted unless you pass `--show-url`.
+## Handling credentials safely
+
+The CLI uses personal EBS API tokens. It never asks for the object store's root key or system credentials, and it keeps your EBS token and S3 credentials out of each other's requests. Keep tokens and temporary S3 credentials out of logs, scripts, and shell history:
+
+- `ebs s3 credentials` prints the temporary access key, secret key, and session token to stdout. Protect that output and shared terminals.
+- The direct S3 commands (`s3 ls`, `s3 download`, `s3 rm`, `s3 upload`) do not display temporary credentials, and signed URLs stay redacted unless you pass `--show-url`.

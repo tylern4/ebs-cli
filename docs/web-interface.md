@@ -12,7 +12,7 @@ Open the site and use the single sign-in button on the login page. Sign-in uses 
 
 ## Choose a Project
 
-A selector in the app header picks the Project you are working in. It lists the Projects you belong to, with your role in each, and defaults to an aggregate view across all of your Projects. The selected Project scopes every page: the trigger table, the events views, and the create form all operate inside it. This matches the CLI's `ebs projects use` default (see [Authentication and Projects](authentication.md)).
+A selector in the app header picks the Project you are working in. It lists the Projects you belong to, with your role in each, and defaults to an aggregate view across all of your Projects. The selected Project scopes every page: the trigger table, the events views, and the create form all operate inside it. The CLI equivalent is saving a default Project with `ebs projects use` (see [Authentication and Projects](authentication.md)).
 
 ## Create a personal token for the CLI
 
@@ -22,7 +22,7 @@ The Settings page has an **API tokens** section for the personal tokens that scr
 2. The full token is shown once, in a copyable banner. Store it in your password manager or script before leaving the page; only a hash is kept, so it can never be displayed again.
 3. The list below shows each token's name, creation time, last-used time, and state (Active or Revoked). Revoke a token with its inline confirmation when you no longer need it.
 
-Then run `ebs auth login` in a terminal and paste the token (see [Authentication and Projects](authentication.md)). The Settings page also stores your personal job-submission credentials for triggers that fire on your behalf; that section is unrelated to CLI login.
+Then run `ebs auth login --token` in a terminal and paste the token at the hidden prompt (see [Authentication and Projects](authentication.md)). The Settings page also stores your personal job-submission credentials for triggers that fire on your behalf; that section is unrelated to CLI login.
 
 ## Create and manage triggers
 
@@ -49,4 +49,4 @@ On the detail page of an S3 trigger that you may manage, an upload-data section 
 - **Presigned upload link**: a PUT URL for one object key, valid until it expires. The signed URL is masked until you explicitly reveal it.
 - **Temporary credentials**: an access key, secret key, and session token for any S3 client, with lifetimes of 15 or 30 minutes or 1 hour.
 
-Secret values on this page stay masked until revealed, are held only in the page until you discard them or navigate away, and are never shown again after that. The page also shows ready-to-copy CLI commands for the same operations, carrying the selected Project and this trigger's identifier; the CLI (see [S3 operations and boto3](s3.md)) is the recommended path because it mints its own credentials and keeps them out of the browser.
+Secret values on this page stay masked until you reveal them, are held only in the page until you discard them or navigate away, and are never shown again after that. The page also shows ready-to-copy CLI commands for the same operations, carrying the selected Project and this trigger's identifier. For anything beyond a one-off upload, prefer the CLI (see [S3 operations and boto3](s3.md)): it handles temporary credentials for you and keeps them out of the browser.

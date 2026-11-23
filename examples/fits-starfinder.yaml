@@ -1,0 +1,42 @@
+# Replace the synthetic Project, scheduler, Username, Account, and bucket.
+# This inline template downloads each matching FITS object and runs a mock
+# starfinder command. Replace that command with your actual application.
+name: fits-starfinder
+project: example-project
+version: v1
+enabled: true
+machine: example-scheduler
+sfapi_username: example-user
+sfapi_account: example-account
+pipeline:
+  input_type: s3_bucket_events
+  matchers:
+    event_type: s3.object.created
+    s3_bucket: example-input-bucket
+    path_prefix: incoming/
+    file_types: [.fits, .fit]
+  outputs:
+    mode: start_job
+    job_spec:
+      source: template
+      template: |
+        #!/bin/bash
+        #SBATCH --job-name=starfinder
+        #SBATCH --account={{ event.account }}
+        #SBATCH --nodes=1
+        #SBATCH --ntasks=1
+        #SBATCH --cpus-per-task=4
+        #SBATCH --time=00:10:00
+
+        set -euo pipefail
+
+        output_dir="$SCRATCH/starfinder/{{ job.id }}"
+        mkdir -p "$output_dir"
+        cd "$output_dir"
+
+        curl --fail --location --silent --show-error \
+          --output input.fits \
+          '{{ s3.presigned_url }}'
+
+        starfinder --input input.fits --output catalog.csv --threshold 5
+        test -s catalog.csv
