@@ -88,6 +88,33 @@ credential by **Username** and **Account**, rather than an internal credential U
 `source: template` carries that inline script. Inline-template jobs using a bound
 credential require a valid Account under the existing backend contract.
 
+When the object pattern is the only S3 filter, `matchers` can instead be one full S3 URI:
+
+```yaml
+pipeline:
+  input_type: s3_bucket_events
+  matchers: s3://cfs/????-??-??/*.list.allfiles
+```
+
+The CLI translates that example before any API request to the existing structured fields:
+
+```yaml
+matchers:
+  s3_bucket: cfs
+  path_glob: ????-??-??/*
+  file_types: [.list.allfiles]
+```
+
+`s3://bucket` and `s3://bucket/` select a whole bucket. `s3://bucket/incoming/` selects
+that literal prefix. The part after the final `*` can be one lowercase dot-suffix, such as
+`.nc` or `.list.allfiles`, of at most 32 characters. Patterns allow at most 12 `*` or `?`
+wildcards and a 256-character path. This is glob syntax, not raw regular expression
+syntax: `*` and `?` are wildcards, while all other regex metacharacters match literally.
+
+Use a structured matchers object to combine a pattern with S3 event types or any other
+filter. Job-event matchers must also be structured objects. Export emits the canonical
+structured object, so an exported trigger can be applied without an update.
+
 #### S3 start-job with a scheduler-hosted script
 
 The same pipeline can instead reference an existing batch file on the scheduler:

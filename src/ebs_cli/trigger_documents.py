@@ -2,13 +2,22 @@
 
 import copy
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Annotated, Any, BinaryIO, Literal
 from uuid import UUID
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from ebs_cli.client import NAME_LOOKUP_LIMIT, EBSClient
 from ebs_cli.errors import CLIError
@@ -86,10 +95,67 @@ class MatchersDocument(DocumentModel):
     raw_yaml: str | None = None
 
 
+_S3_FILE_TYPE = re.compile(r"\.[a-z0-9]+(\.[a-z0-9]+)*")
+_MAX_FILE_TYPE_CHARS = 32
+_MAX_PATH_GLOB_CHARS = 256
+_MAX_PATH_GLOB_WILDCARDS = 12
+
+
+def _s3_pattern_matchers(pattern: str) -> dict[str, Any]:
+    """Translate the frontend's bounded S3 glob form without echoing input."""
+    rest = pattern.strip()
+    if not rest.lower().startswith("s3://"):
+        raise ValueError("S3 matcher scalar must be a full s3://bucket/<key-pattern> URI")
+    rest = rest[len("s3://") :]
+    slash = rest.find("/")
+    if slash < 0:
+        if not rest:
+            raise ValueError("S3 matcher URI must include a nonblank bucket")
+        return {"s3_bucket": rest}
+    bucket = rest[:slash]
+    if not bucket.strip():
+        raise ValueError("S3 matcher URI must include a nonblank bucket")
+    rest = rest[slash + 1 :]
+    last_star = rest.rfind("*")
+    key_part = rest if last_star < 0 else rest[:last_star]
+    suffix = "" if last_star < 0 else rest[last_star + 1 :]
+    if suffix and (len(suffix) > _MAX_FILE_TYPE_CHARS or _S3_FILE_TYPE.fullmatch(suffix) is None):
+        raise ValueError("S3 matcher suffix must be a lowercase dot-suffix of at most 32 characters")
+    if sum(character in "*?" for character in rest) > _MAX_PATH_GLOB_WILDCARDS:
+        raise ValueError("S3 matcher supports at most 12 * or ? wildcards")
+    if len(key_part) > _MAX_PATH_GLOB_CHARS:
+        raise ValueError("S3 matcher path must contain at most 256 characters")
+
+    spec: dict[str, Any] = {"s3_bucket": bucket}
+    if key_part:
+        if any(character in "*?" for character in key_part):
+            # A glob covers the full key. Re-add the filename wildcard before a
+            # suffix so core's anchored glob leaves that suffix to file_types.
+            spec["path_glob"] = f"{key_part}*" if suffix else rest
+            if len(spec["path_glob"]) > _MAX_PATH_GLOB_CHARS:
+                raise ValueError("S3 matcher path must contain at most 256 characters")
+        else:
+            spec["path_prefix"] = key_part
+    if suffix:
+        spec["file_types"] = [suffix]
+    return spec
+
+
 class PipelineDocument(DocumentModel):
     input_type: Literal["s3_bucket_events", "job_events"]
     matchers: MatchersDocument
     outputs: PipelineOutputDocument
+
+    @field_validator("matchers", mode="before")
+    @classmethod
+    def translate_s3_matcher(cls, value: Any, info: ValidationInfo) -> Any:
+        if not isinstance(value, str):
+            return value
+        if info.data.get("input_type") == "job_events":
+            raise ValueError("job-event matchers must be a structured object")
+        if info.data.get("input_type") == "s3_bucket_events":
+            return _s3_pattern_matchers(value)
+        return value
 
 
 class TriggerDocument(DocumentModel):

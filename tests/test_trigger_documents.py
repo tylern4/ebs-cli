@@ -225,6 +225,177 @@ def test_stdin_requires_and_uses_explicit_format(
     assert len([call for call in document_api.calls if call[0] == "create_trigger"]) == 1
 
 
+@pytest.mark.parametrize("syntax", ["json", "yaml"])
+@pytest.mark.parametrize(
+    "pattern,expected",
+    [
+        ("s3://imaging-lab", {"s3_bucket": "imaging-lab"}),
+        ("s3://imaging-lab/", {"s3_bucket": "imaging-lab"}),
+        ("s3://b/archive/", {"s3_bucket": "b", "path_prefix": "archive/"}),
+        ("s3://b/archive/*", {"s3_bucket": "b", "path_prefix": "archive/"}),
+        (
+            "s3://imaging-lab/frames/*.jpeg",
+            {"s3_bucket": "imaging-lab", "path_prefix": "frames/", "file_types": [".jpeg"]},
+        ),
+        (
+            "s3://cfs/????-??-??/*.list.allfiles",
+            {"s3_bucket": "cfs", "path_glob": "????-??-??/*", "file_types": [".list.allfiles"]},
+        ),
+        (
+            "s3://b/runs/202?/*.nc",
+            {"s3_bucket": "b", "path_glob": "runs/202?/*", "file_types": [".nc"]},
+        ),
+        ("s3://b/runs/202?/*", {"s3_bucket": "b", "path_glob": "runs/202?/*"}),
+        (
+            "s3://b/[ab]+.(x)/sample_?.csv",
+            {"s3_bucket": "b", "path_glob": "[ab]+.(x)/sample_?.csv"},
+        ),
+        (
+            "s3://b/a*b*.jpeg",
+            {"s3_bucket": "b", "path_glob": "a*b*", "file_types": [".jpeg"]},
+        ),
+    ],
+)
+def test_s3_uri_scalar_parses_to_canonical_structured_matchers(
+    syntax: str, pattern: str, expected: dict[str, Any]
+) -> None:
+    body = document()
+    body["pipeline"]["matchers"] = pattern
+    content = json.dumps(body) if syntax == "json" else yaml.safe_dump(body)
+
+    parsed = parse_trigger_document(content.encode(), syntax)
+
+    assert parsed.pipeline.matchers.model_dump(exclude_none=True) == expected
+    assert canonical_pipeline(parsed.pipeline)["matchers"] == expected
+
+
+@pytest.mark.parametrize(
+    "pattern,expected",
+    [
+        ("s3://b/" + "?" * 11 + "/*", "?" * 11 + "/*"),
+        ("s3://b/" + "a" * 254 + "?*", "a" * 254 + "?*"),
+    ],
+)
+def test_s3_uri_accepts_wildcard_and_path_boundaries(pattern: str, expected: str) -> None:
+    body = document()
+    body["pipeline"]["matchers"] = pattern
+
+    parsed = parse_trigger_document(json.dumps(body).encode(), "json")
+
+    assert parsed.pipeline.matchers.path_glob == expected
+
+
+def test_s3_uri_accepts_32_character_canonical_suffix() -> None:
+    suffix = ".a" * 16
+    body = document()
+    body["pipeline"]["matchers"] = f"s3://b/*{suffix}"
+
+    parsed = parse_trigger_document(json.dumps(body).encode(), "json")
+
+    assert parsed.pipeline.matchers.file_types == [suffix]
+
+
+def test_existing_structured_s3_matchers_are_unchanged() -> None:
+    matchers = {
+        "event_type": "s3.object.created",
+        "s3_events": ["s3.object.created"],
+        "s3_bucket": "b",
+        "path_glob": "[ab]+.(x)/sample_?.csv",
+        "file_types": [".csv"],
+        "user": "example",
+        "group": "example-project",
+    }
+    body = document()
+    body["pipeline"]["matchers"] = copy.deepcopy(matchers)
+
+    parsed = parse_trigger_document(json.dumps(body).encode(), "json")
+
+    assert canonical_pipeline(parsed.pipeline)["matchers"] == matchers
+
+
+@pytest.mark.parametrize("command", ["create", "apply"])
+@pytest.mark.parametrize("syntax", ["json", "yaml"])
+def test_s3_uri_create_and_apply_send_only_canonical_matchers(
+    runner: CliRunner,
+    document_api: DocumentAPI,
+    tmp_path: Path,
+    command: str,
+    syntax: str,
+) -> None:
+    body = document()
+    body["pipeline"]["matchers"] = "s3://cfs/????-??-??/*.list.allfiles"
+    path = write_document(tmp_path / f"trigger.{syntax}", body, syntax)
+
+    result = runner.invoke(app, ["triggers", command, "--file", str(path), "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = document_api.calls[-1][1]
+    assert payload["pipeline"]["matchers"] == {
+        "s3_bucket": "cfs",
+        "path_glob": "????-??-??/*",
+        "file_types": [".list.allfiles"],
+    }
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "",
+        "   ",
+        "bucket/without/scheme/*.nc",
+        "s3://",
+        "s3:///prefix/*.nc",
+        "s3://   /prefix/*.nc",
+        "s3://private-bucket/runs/*ebs_private_suffix",
+        "s3://private-bucket/runs/*.JPEG",
+        "s3://private-bucket/runs/*.bad..suffix",
+        "s3://private-bucket/runs/*" + ".a" * 16 + "b",
+        "s3://private-bucket/" + "?" * 13,
+        "s3://private-bucket/" + "a" * 257,
+        "s3://private-bucket/" + "a" * 255 + "?*.nc",
+    ],
+)
+def test_invalid_s3_uri_is_private_and_fails_before_client_construction(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pattern: str
+) -> None:
+    body = document()
+    body["pipeline"]["matchers"] = pattern
+    path = write_document(tmp_path / "trigger.yaml", body)
+
+    def should_not_construct(*args: Any):
+        raise AssertionError("client constructed for invalid S3 matcher")
+
+    monkeypatch.setattr(cli, "_normal_api_client", should_not_construct)
+    result = runner.invoke(app, ["triggers", "apply", "--file", str(path)])
+
+    assert result.exit_code == 2
+    assert "pipeline.matchers" in result.stderr
+    output = result.stdout + result.stderr
+    if pattern.strip() and pattern != "s3://":
+        assert pattern not in output
+    assert "private-bucket" not in output
+    assert "ebs_private_suffix" not in output
+
+
+def test_job_event_matcher_scalar_fails_before_client_construction(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    body = document(callback=True)
+    body["pipeline"]["matchers"] = "s3://private-bucket/jobs/*"
+    path = write_document(tmp_path / "trigger.json", body)
+
+    def should_not_construct(*args: Any):
+        raise AssertionError("client constructed for job matcher scalar")
+
+    monkeypatch.setattr(cli, "_normal_api_client", should_not_construct)
+    result = runner.invoke(app, ["triggers", "create", "--file", str(path)])
+
+    assert result.exit_code == 2
+    assert "pipeline.matchers" in result.stderr
+    assert "job-event matchers must be a structured object" in result.stderr
+    assert body["pipeline"]["matchers"] not in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("bad", [[], None, "text", 1])
 def test_non_object_roots_are_rejected(bad: Any) -> None:
     with pytest.raises(CLIError, match="root must be one object"):
@@ -531,6 +702,27 @@ def test_apply_derived_machine_and_absent_none_normalization_are_noop(
     assert json.loads(result.stdout)["action"] == "unchanged"
     assert not any(call[0] in {"create_trigger", "update_trigger"} for call in document_api.calls)
     assert "already up to date" not in result.stdout  # --json remains machine-only
+
+
+def test_s3_uri_scalar_matches_existing_structured_state_without_patch(
+    runner: CliRunner, document_api: DocumentAPI, tmp_path: Path
+) -> None:
+    stored = document()
+    stored["pipeline"]["matchers"] = {
+        "s3_bucket": "cfs",
+        "path_glob": "????-??-??/*",
+        "file_types": [".list.allfiles"],
+    }
+    document_api.current = response_for({**stored, "sfapi_token_ref": None, "sfapi_account": None})
+    authored = document()
+    authored["pipeline"]["matchers"] = "s3://cfs/????-??-??/*.list.allfiles"
+    path = write_document(tmp_path / "trigger.json", authored)
+
+    result = runner.invoke(app, ["triggers", "apply", "--file", str(path), "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["action"] == "unchanged"
+    assert not any(call[0] in {"create_trigger", "update_trigger"} for call in document_api.calls)
 
 
 def test_apply_noop_human_output_is_bounded(
@@ -843,6 +1035,32 @@ def test_export_then_apply_is_noop_for_start_job_and_callback(
     exported = runner.invoke(app, ["triggers", "export", "data-ready"])
     assert exported.exit_code == 0, exported.output
     path = tmp_path / "roundtrip.yaml"
+    path.write_text(exported.stdout, encoding="utf-8")
+    document_api.current = document_api.export_trigger
+    document_api.export_trigger = None
+
+    applied = runner.invoke(app, ["triggers", "apply", "--file", str(path), "--json"])
+
+    assert applied.exit_code == 0, applied.output
+    assert json.loads(applied.stdout)["action"] == "unchanged"
+    assert not any(call[0] in {"create_trigger", "update_trigger"} for call in document_api.calls)
+
+
+def test_s3_structured_export_then_apply_is_noop(
+    runner: CliRunner, document_api: DocumentAPI, tmp_path: Path
+) -> None:
+    stored = document()
+    structured = {
+        "s3_bucket": "cfs",
+        "path_glob": "????-??-??/*",
+        "file_types": [".list.allfiles"],
+    }
+    stored["pipeline"]["matchers"] = structured
+    set_export(document_api, stored)
+    exported = runner.invoke(app, ["triggers", "export", "data-ready"])
+    assert exported.exit_code == 0, exported.output
+    assert yaml.safe_load(exported.stdout)["pipeline"]["matchers"] == structured
+    path = tmp_path / "s3-roundtrip.yaml"
     path.write_text(exported.stdout, encoding="utf-8")
     document_api.current = document_api.export_trigger
     document_api.export_trigger = None
