@@ -83,6 +83,8 @@ ebs s3 upload TRIGGER ./data.fits
 
 | Guide | Contents |
 | --- | --- |
+| [FITS pipeline with the web interface](docs/fits-starfinder-web-ui.md) | Upload FITS files and process them with a mock `starfinder` batch-job trigger |
+| [FITS pipeline with the CLI](docs/fits-starfinder-cli.md) | The same mock star-finding workflow with YAML trigger documents and `ebs` commands |
 | [Web interface](docs/web-interface.md) | Signing in, Projects, tokens, triggers, events, and upload access in the browser |
 | [Authentication and Projects](docs/authentication.md) | Globus browser login, manual tokens, refresh/logout, config security, and Project precedence |
 | [Triggers and events](docs/triggers.md) | Listing, filtering, pagination, trigger references |
