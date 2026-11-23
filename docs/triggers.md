@@ -156,6 +156,9 @@ be applied without an update.
 
 #### S3 start-job with a scheduler-hosted script
 
+See the complete [`examples/s3-path-regex-start-job.yaml`](../examples/s3-path-regex-start-job.yaml)
+document for a structured raw RE2 path matcher in this configuration.
+
 The same pipeline can instead reference an existing batch file on the scheduler:
 
 ```yaml

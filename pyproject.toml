@@ -34,7 +34,7 @@ dev = [
 packages = ["src/ebs_cli"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/docs", "/README.md", "/LICENSE", "/pyproject.toml"]
+include = ["/src", "/tests", "/docs", "/examples", "/README.md", "/LICENSE", "/pyproject.toml"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"
